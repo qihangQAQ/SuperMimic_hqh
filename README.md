@@ -131,6 +131,21 @@ CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
   --ckpt runs/supermimic_mjwarp_001/ckpt_012000.pt
 ```
 
+## Live Viewer
+
+Run from a desktop terminal to execute the policy in one MuJoCo environment with a blue reference-motion ghost. Close the window to exit. A single-GPU machine does not need `CUDA_VISIBLE_DEVICES`.
+
+```bash
+MUJOCO_GL=glfw uv run --no-sync tools/play_supermimic.py \
+  --ckpt runs/supermimic_mjwarp_001/ckpt_012000.pt \
+  --clip walk1_subject1 \
+  --loop
+```
+
+The default backend is `mujoco`; use `--backend mjwarp` to match mjwarp training. `--loop` restarts on completion or failure; otherwise the viewer holds the final frame until closed. Use `--speed 0.5` for slow playback or `--align-reference` to align the reference XY position to the policy. Mouse perturbations affect only the display model. Each completed episode prints `norm_return`, `steps`, and `failed`; use the evaluation commands above to save full metrics.
+
+The viewer script defaults to Hugging Face offline mode and uses downloaded local assets. Single-environment `mujoco` playback runs the policy on CPU by default and does not require CUDA; use `--device cuda` to request it explicitly.
+
 ## Video Export
 
 The following command rolls out `jumps1_subject1` continuously from a checkpoint, trims the result to the jumping segment from 6–14 seconds, and writes a 25 fps comparison MP4:

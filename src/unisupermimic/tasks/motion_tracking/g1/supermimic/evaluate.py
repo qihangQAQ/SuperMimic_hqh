@@ -254,7 +254,14 @@ def watch(
         time.sleep(poll_seconds)
 
 
-def make_eval_env(run_dir: Path, backend: str = "mjwarp") -> SuperMimicManagerBasedRlEnv:
+def make_eval_env(
+    run_dir: Path,
+    backend: str = "mjwarp",
+    *,
+    num_envs: int | None = None,
+    device: str | None = None,
+) -> SuperMimicManagerBasedRlEnv:
+    """Build a deterministic environment, defaulting to one environment per clip."""
     from hydra import compose, initialize_config_dir
     from unilab.base.config_adapter import create_env
     from unilab.base.process_device import configure_backend_process_device
@@ -276,7 +283,7 @@ def make_eval_env(run_dir: Path, backend: str = "mjwarp") -> SuperMimicManagerBa
         algo_name="supermimic",
         strict=bool(cfg.training.sim2sim_strict),
     )
-    device = get_default_device()
+    device = get_default_device() if device is None else device
     bound_device = configure_backend_process_device(str(cfg.training.sim_backend), device)
     if bound_device is not None:
         device = bound_device
@@ -284,7 +291,7 @@ def make_eval_env(run_dir: Path, backend: str = "mjwarp") -> SuperMimicManagerBa
         "SuperMimicManagerBasedRlEnv",
         create_env(
             cfg,
-            num_envs=len(cfg.env.commands.motion.motion_files),
+            num_envs=len(cfg.env.commands.motion.motion_files) if num_envs is None else num_envs,
             env_cfg_override=build_env_override(cfg, eval_mode=True, learner_device=device),
         ),
     )

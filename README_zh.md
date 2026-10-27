@@ -131,6 +131,21 @@ CUDA_VISIBLE_DEVICES=0 uv run unisupermimic-eval \
   --ckpt runs/supermimic_mjwarp_001/ckpt_012000.pt
 ```
 
+## 实时窗口
+
+在桌面终端中运行以下命令，用单个 MuJoCo 环境实时执行训练好的策略。实体机器人是策略结果，蓝色半透明机器人是参考动作；关闭窗口退出。只有一张显卡时无需设置 `CUDA_VISIBLE_DEVICES`。
+
+```bash
+MUJOCO_GL=glfw uv run --no-sync tools/play_supermimic.py \
+  --ckpt runs/supermimic_mjwarp_001/ckpt_012000.pt \
+  --clip walk1_subject1 \
+  --loop
+```
+
+默认后端为 `mujoco`，可用 `--backend mjwarp` 保持与训练相同的后端。`--loop` 会在动作结束或失败后从首帧重来；不传则停在最后一帧，直到关闭窗口。`--speed 0.5` 可慢放，`--align-reference` 可将参考动作的水平位置对齐策略。窗口用于观察实时仿真，鼠标拖拽不会向策略的物理环境施力。每段结束时终端打印 `norm_return`、`steps` 和 `failed`，不保存评估文件；完整指标请使用上面的评估命令。
+
+窗口脚本默认启用 Hugging Face 离线模式，使用已下载的本地资产。单环境 `mujoco` 播放默认在 CPU 上运行策略，不要求 CUDA 可用；需要时可显式传入 `--device cuda`。
+
 ## 视频导出
 
 以下命令从 checkpoint 连续采样 `jumps1_subject1`，截取第 6–14 秒的跳跃片段，生成 25 fps 的参考动作对比 MP4：

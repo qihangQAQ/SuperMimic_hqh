@@ -22,6 +22,7 @@ dependencies = [
     "imageio[ffmpeg]>=2.37",
     "mujoco~=3.11.0",
     "pillow>=10",
+    "socksio>=1.0.0",
 ]
 
 [project.scripts]
