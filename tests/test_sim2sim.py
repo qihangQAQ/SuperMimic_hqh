@@ -87,3 +87,30 @@ def test_policy_shape_mismatch_fails_closed(tmp_path: Path) -> None:
 
     with pytest.raises(CrossBackendIncompatibleError, match="algo.policy_hidden"):
         resolve_sim2sim_config(tmp_path, target, strict=True)
+
+
+def test_motion_override_only_relaxes_motion_identity(tmp_path: Path) -> None:
+    source, target = _cfg(), _cfg()
+    target.env.commands.motion.motion_files = ["unseen.csv"]
+    (tmp_path / "run_config.json").write_text(
+        json.dumps({"contract_snapshot": extract_contract_snapshot(source)})
+    )
+    with pytest.raises(CrossBackendIncompatibleError, match="motion_files"):
+        resolve_sim2sim_config(tmp_path, target)
+    resolve_sim2sim_config(tmp_path, target, allow_motion_override=True)
+    target.algo.goal_frames = 21
+    with pytest.raises(CrossBackendIncompatibleError, match="goal_frames"):
+        resolve_sim2sim_config(tmp_path, target, allow_motion_override=True)
+
+
+def test_legacy_defaults_and_attention_contract(tmp_path: Path) -> None:
+    source, target = _cfg(), _cfg()
+    snapshot = extract_contract_snapshot(source)
+    (tmp_path / "run_config.json").write_text(json.dumps({"contract_snapshot": snapshot}))
+    OmegaConf.update(target, "algo.policy_type", "mlp", force_add=True)
+    OmegaConf.update(target, "env.commands.motion.reference_past", -1, force_add=True)
+    OmegaConf.update(target, "env.commands.motion.recovery", {"enabled": False}, force_add=True)
+    resolve_sim2sim_config(tmp_path, target)
+    OmegaConf.update(target, "algo.policy_type", "rgmt")
+    with pytest.raises(CrossBackendIncompatibleError, match="policy_type"):
+        resolve_sim2sim_config(tmp_path, target)

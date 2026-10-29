@@ -34,11 +34,14 @@ class ReplayBuffer:
         device: str | torch.device,
         num_joints: int = 29,
         context_dim: int = 33,
+        force_dim: int = 0,
     ):
         self.T = T
         self.N = N
         self.device = torch.device(device)
         self.fields = _make_fields(num_joints, context_dim)
+        if force_dim:
+            self.fields.update(force=(force_dim, torch.float32), recovery=((), torch.bool))
         self.data = {}
         for key, (shape, dtype) in self.fields.items():
             field_shape = (T, N) + ((shape,) if isinstance(shape, int) else shape)
@@ -66,6 +69,8 @@ class ReplayBuffer:
         rows = self._row(ages)
         envs = env.unsqueeze(-1).expand_as(rows)
         out = {key: self.data[key][rows, envs] for key in ("s", "s1", "a", "xi", "done")}
+        if "force" in self.data:
+            out.update({key: self.data[key][rows, envs] for key in ("force", "recovery")})
         done = out["done"].float()
         mask = torch.cumprod(
             torch.cat((torch.ones(B, 1, device=self.device), 1 - done[:, :-1]), -1),
@@ -94,6 +99,8 @@ class ReplayBuffer:
         history_rows = self._row(age.unsqueeze(-1) - back)
         history_envs = env.unsqueeze(-1).expand_as(history_rows)
         start = {key: self.data[key][row, env] for key in ("s", "a_prev", "xi", "f")}
+        if "force" in self.data:
+            start.update({key: self.data[key][row, env] for key in ("force", "recovery")})
         history = {
             key: self.data[key][history_rows, history_envs] for key in ("s", "a_prev", "xi", "f")
         }

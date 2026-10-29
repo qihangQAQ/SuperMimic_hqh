@@ -116,6 +116,16 @@ def _close_env(env: Any) -> None:
 
 def main(cfg: DictConfig) -> None:
     ensure_registries()
+    from unisupermimic.tasks.motion_tracking.g1.supermimic.datasets import (
+        load_motion_split,
+        motion_identity,
+    )
+
+    manifest = OmegaConf.select(cfg, "training.motion_manifest")
+    dataset = None
+    if manifest is not None:
+        files, dataset = load_motion_split(str(manifest), str(cfg.training.motion_split))
+        cfg.env.commands.motion.motion_files = files
     if float(cfg.algo.gamma) != float(cfg.env.commands.motion.gamma):
         raise ValueError("SuperMimic requires algo.gamma == env.commands.motion.gamma")
     seed_info = apply_configured_training_seed(cfg, torch_runtime=True, cuda=True)
@@ -136,6 +146,7 @@ def main(cfg: DictConfig) -> None:
         )
         log_dir = checkpoint.parent
     elif checkpoint is not None:
+        resolve_sim2sim_config(checkpoint.parent, cfg, strict=True)
         log_dir = checkpoint.parent
     else:
         log_dir = Path(resolve_run_log_dir(cfg))
@@ -154,6 +165,21 @@ def main(cfg: DictConfig) -> None:
             full_cfg=cfg,
             contract_snapshot=extract_contract_snapshot(cfg),
         )
+
+    if not play_only:
+        if dataset is None:
+            dataset = {
+                "split": "unspecified",
+                "motions": motion_identity(list(cfg.env.commands.motion.motion_files)),
+            }
+        identity_path = log_dir / "motion_dataset.json"
+        if checkpoint is not None and identity_path.is_file():
+            if json.loads(identity_path.read_text(encoding="utf-8")) != dataset:
+                raise ValueError(
+                    "resume motion content or split identity differs from the recorded dataset"
+                )
+        else:
+            identity_path.write_text(json.dumps(dataset, indent=2) + "\n", encoding="utf-8")
 
     env = None
     try:

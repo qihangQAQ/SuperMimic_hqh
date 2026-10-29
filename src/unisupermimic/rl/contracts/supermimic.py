@@ -68,6 +68,19 @@ class SuperMimicMdpProtocol(Protocol):
 
 
 @runtime_checkable
+class RecoveryMdpProtocol(SuperMimicMdpProtocol, Protocol):
+    force_dim: int
+
+    def recovery_mask(self, frames: torch.Tensor) -> torch.Tensor: ...
+
+    def advance_frames(self, frames: torch.Tensor) -> torch.Tensor: ...
+
+    def advance_force(self, frames: torch.Tensor, force: torch.Tensor) -> torch.Tensor: ...
+
+    def task_features(self, frames: torch.Tensor, force: torch.Tensor) -> torch.Tensor: ...
+
+
+@runtime_checkable
 class SupportsSuperMimicProtocol(Protocol):
     """Environment exposing its task-owned SuperMimic implementation."""
 
@@ -86,6 +99,7 @@ __all__ = [
     "SUPERMIMIC_STATE_KEY",
     "SUPERMIMIC_TRANSITION_KEY",
     "State",
+    "RecoveryMdpProtocol",
     "SuperMimicMdpProtocol",
     "SupportsSuperMimicProtocol",
     "get_supermimic_mdp",

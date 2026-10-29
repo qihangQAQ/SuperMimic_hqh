@@ -18,6 +18,7 @@ from unisupermimic.rl.contracts.supermimic import State
 
 from .kinematics import G1Kinematics
 from .motion import CONTROL_DT, MotionLib
+from .recovery import RecoveryConfig
 
 STATE_DIM = 71
 NUM_J = 29
@@ -78,6 +79,8 @@ class MDP:
         motion: MotionLib,
         default_q: torch.Tensor,
         cfg: RewardCfg | None = None,
+        reference_past: int = -1,
+        recovery: RecoveryConfig | None = None,
     ):
         if default_q.shape != (NUM_J,):
             raise ValueError(
@@ -86,6 +89,14 @@ class MDP:
         self.kin = kin
         self.motion = motion
         self.cfg = RewardCfg() if cfg is None else cfg
+        self.reference_past = reference_past
+        self.recovery = recovery or RecoveryConfig()
+        self.force_dim = 3 if self.recovery.enabled else 0
+        self.recovery_steps = max(1, round(self.recovery.seconds / CONTROL_DT))
+        if self.recovery.enabled:
+            motion.add_standing_reference(
+                kin, default_q, self.recovery.stand_height, self.recovery_steps
+            )
         self.default_q = default_q
         middle = (kin.q_lo + kin.q_hi) / 2
         half_range = (kin.q_hi - kin.q_lo) / 2
@@ -136,7 +147,44 @@ class MDP:
         return obs + (2 * torch.rand_like(obs) - 1) * self.obs_noise
 
     def goal(self, frames: torch.Tensor, num_frames: int) -> torch.Tensor:
+        if self.reference_past >= 0:
+            return self.motion.window_goal(frames, self.reference_past, num_frames)
         return self.motion.goal(frames, num_frames)
+
+    def recovery_mask(self, frames: torch.Tensor) -> torch.Tensor:
+        if not self.recovery.enabled:
+            return torch.zeros_like(frames, dtype=torch.bool)
+        return frames >= self.motion.recovery_start
+
+    def advance_frames(self, frames: torch.Tensor) -> torch.Tensor:
+        return torch.minimum(frames + 1, self.motion.clip_end[self.motion.clip_id[frames]])
+
+    def task_features(self, frames: torch.Tensor, force: torch.Tensor) -> torch.Tensor:
+        recovery = self.recovery_mask(frames)
+        remaining = (self.motion.recovery_end - frames).clamp(min=0) / self.recovery_steps
+        return torch.cat(
+            (
+                recovery.float().unsqueeze(-1),
+                torch.where(recovery, remaining, 0).unsqueeze(-1),
+                force / 200,
+            ),
+            -1,
+        )
+
+    def advance_force(self, frames: torch.Tensor, force: torch.Tensor) -> torch.Tensor:
+        active = self.recovery_mask(frames) & (frames < self.motion.recovery_end)
+        return torch.where(active.unsqueeze(-1), force, 0)
+
+    def recovered(self, state: State) -> torch.Tensor:
+        p, rotation, velocity, angular, q, _ = state
+        cfg = self.recovery
+        return (
+            ((p[..., 2] - cfg.stand_height).abs() < cfg.height_tolerance)
+            & (rotation[..., 2, 2] > torch.cos(rotation.new_tensor(cfg.tilt_tolerance)))
+            & ((q - self.default_q).square().mean(-1).sqrt() < cfg.joint_tolerance)
+            & (velocity.norm(dim=-1) < cfg.velocity_tolerance)
+            & (angular.norm(dim=-1) < cfg.velocity_tolerance)
+        )
 
     @overload
     def reward(
@@ -206,6 +254,12 @@ class MDP:
         reward = (
             tracking + cfg.w_action_rate * action_rate + cfg.w_joint_limit * joint_limit
         ) * CONTROL_DT
+        if self.recovery.enabled and self.recovery.shaping_weight:
+            shaping = rotation[..., 2, 2] - (position[..., 2] - self.recovery.stand_height).square()
+            reward = (
+                reward
+                + self.recovery_mask(frames) * self.recovery.shaping_weight * shaping * CONTROL_DT
+            )
         if terms:
             return reward, {
                 "track": tracking * CONTROL_DT,
@@ -223,7 +277,11 @@ class MDP:
         ref_p, ref_R = self.motion.root_p[frames], self.motion.root_R[frames]
         error_height = (ref_p[..., 2] - position[..., 2]).abs()
         error_tilt = (ref_R[..., 2, 2] - rotation[..., 2, 2]).abs()
-        return (error_height > self.cfg.term_height) | (error_tilt > self.cfg.term_tilt)
+        failed = (error_height > self.cfg.term_height) | (error_tilt > self.cfg.term_tilt)
+        finite = torch.stack(
+            [value.flatten(start_dim=1).isfinite().all(-1) for value in state]
+        ).all(0)
+        return (failed & ~self.recovery_mask(frames)) | ~finite
 
     def soft_termination(
         self,
@@ -240,7 +298,12 @@ class MDP:
         alive = (1 - torch.sigmoid((error_height - self.cfg.term_height) / height_temperature)) * (
             1 - torch.sigmoid((error_tilt - self.cfg.term_tilt) / tilt_temperature)
         )
-        return 1 - alive
+        terminated = 1 - alive
+        if self.recovery.enabled:
+            # A recovery episode has a finite horizon, irrespective of success.
+            deadline = (frames >= self.motion.recovery_end).float()
+            terminated = torch.where(self.recovery_mask(frames), deadline, terminated)
+        return terminated
 
     def critic_features(
         self,
@@ -294,9 +357,26 @@ class MDP:
             -1,
         )
 
+    def tracking_metrics(self, state: State, frames: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Tracked-link errors use the same heading/XY alignment as the reward."""
+        p, rotation, velocity, angular, q, qd = state
+        body_p, _, body_v, _ = self.kin.forward(p, rotation, velocity, angular, q, qd)
+        ref_p, ref_R = self.motion.root_p[frames], self.motion.root_R[frames]
+        heading = yaw_mat(rotation @ ref_R.transpose(-1, -2))
+        anchor = torch.cat((p[..., :2], ref_p[..., 2:3]), -1)
+        target = anchor.unsqueeze(-2) + (
+            heading.unsqueeze(-3) @ (self.motion.body_p[frames] - ref_p.unsqueeze(-2)).unsqueeze(-1)
+        ).squeeze(-1)
+        return {
+            "aligned_body_position_mm": (target - body_p).norm(dim=-1).mean(-1) * 1000,
+            "world_body_velocity_mps": (self.motion.body_v[frames] - body_v).norm(dim=-1).mean(-1),
+            "joint_angle_mae_rad": (q - self.motion.q[frames]).abs().mean(-1),
+            "world_root_position_m": (p - ref_p).norm(dim=-1),
+        }
+
     def valid_imagination_start(self, frames: torch.Tensor, horizon: int) -> torch.Tensor:
         clip_end = self.motion.clip_end[self.motion.clip_id[frames]]
-        return frames + horizon <= clip_end
+        return (frames + horizon <= clip_end) | (self.recovery_mask(frames) & (frames < clip_end))
 
     def ref_state(self, frames: torch.Tensor) -> State:
         return self.motion.ref_state(frames)

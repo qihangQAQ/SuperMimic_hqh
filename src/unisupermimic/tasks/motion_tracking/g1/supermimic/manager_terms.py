@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
+import numpy as np
 import torch
 from unilab.base.reset_selectors import resolve_reset_env_ids
 from unilab.managers import (
@@ -29,7 +30,8 @@ from unisupermimic.rl.contracts.supermimic import State
 
 from .kinematics import G1Kinematics
 from .mdp import MAX_STEP_REWARD, MDP, NUM_J, XI_DIM
-from .motion import BIN_FRAMES, MotionLib
+from .motion import BIN_FRAMES, CONTROL_DT, MotionLib
+from .recovery import RecoveryConfig
 from .robot import G1_JOINT_NAMES, action_scale
 
 if TYPE_CHECKING:
@@ -180,6 +182,8 @@ class SuperMimicCommandCfg(CommandTermCfg):
     max_episode_steps: int = 500
     goal_frames: int = 1
     context_dim: int = XI_DIM
+    reference_past: int = -1
+    recovery: dict[str, Any] | None = None
     resampling_time_range: tuple[float, float] = (1.0e9, 1.0e9)
 
     def build(self, env: ManagerBasedRlEnv) -> SuperMimicCommand:
@@ -206,7 +210,20 @@ class SuperMimicCommand(CommandTerm):
                 f"SuperMimic default joint positions have shape {self.default_q.shape}; "
                 f"expected {(self.num_envs, NUM_J)}"
             )
-        self.mdp = MDP(self.kin, self.motion, self.default_q[0].clone())
+        self.mdp = MDP(
+            self.kin,
+            self.motion,
+            self.default_q[0].clone(),
+            reference_past=cfg.reference_past,
+            recovery=RecoveryConfig(**(cfg.recovery or {})),
+        )
+        self.recovery = self.mdp.recovery
+        if (
+            self.recovery.enabled
+            and not cfg.eval_mode
+            and cfg.max_episode_steps < self.mdp.recovery_steps
+        ):
+            raise ValueError("max_episode_steps must cover the entire recovery window")
         self.gamma = float(cfg.gamma)
         self.eval_mode = cfg.eval_mode
         self.reset_noise = cfg.reset_noise and not cfg.eval_mode
@@ -226,6 +243,38 @@ class SuperMimicCommand(CommandTerm):
         self.last_episode_stats: dict[str, torch.Tensor] = {}
         self._requested_frames: torch.Tensor | None = None
         self._read_phase_bound = False
+        self.curriculum_iteration = 0
+        self.force = torch.zeros(self.num_envs, 3, device=device)
+        self.stable_steps = torch.zeros(self.num_envs, dtype=torch.long, device=device)
+        self._force_body_ids: np.ndarray | None = None
+        self._requested_recovery = False
+        if self.recovery.enabled and self.recovery.assistance_max > 0 and not cfg.eval_mode:
+            self.bind_force()
+
+    def bind_force(self) -> None:
+        if self._force_body_ids is None:
+            _, self._force_body_ids = self.robot.bind_body_wrench(
+                [list(self.robot.body_names).index("pelvis")],
+                torque=False,
+                term_name="supermimic_force",
+            )
+
+    def apply_force(self, force: torch.Tensor, *, external: bool = False) -> None:
+        # Assistance binds at construction; evaluation pushes bind on demand.
+        # Avoid a device-to-host synchronization on every unassisted control step.
+        if self._force_body_ids is None and not external:
+            return
+        self.bind_force()
+        assert self._force_body_ids is not None
+        self.robot.apply_body_wrench_to_sim(
+            force.unsqueeze(1), None, self._force_body_ids, term_name="supermimic_force"
+        )
+
+    def request_recovery(self) -> None:
+        if not self.recovery.enabled:
+            raise ValueError("recovery evaluation requires recovery.enabled=true")
+        self.request_frames(torch.full_like(self.f, self.motion.recovery_start))
+        self._requested_recovery = True
 
     @staticmethod
     def _validate_cfg(cfg: SuperMimicCommandCfg) -> None:
@@ -251,6 +300,8 @@ class SuperMimicCommand(CommandTerm):
             raise ValueError("SuperMimicCommandCfg max_episode_steps must be positive")
         if isinstance(cfg.goal_frames, bool) or cfg.goal_frames <= 0:
             raise ValueError("SuperMimicCommandCfg goal_frames must be positive")
+        if not -1 <= cfg.reference_past < cfg.goal_frames:
+            raise ValueError("reference_past must be -1 or smaller than goal_frames")
         if cfg.context_dim != XI_DIM:
             raise ValueError(f"SuperMimic requires context_dim={XI_DIM}")
 
@@ -319,6 +370,13 @@ class SuperMimicCommand(CommandTerm):
         reset_mask = self._reset_mask_buffer.resolve(ids, owner="SuperMimicCommand.reset")
         if ids.numel() == 0:
             return {}
+        requested = self._requested_frames is not None
+        recovery_rows = torch.zeros(ids.numel(), dtype=torch.bool, device=self._device)
+        if self._requested_recovery:
+            recovery_rows.fill_(True)
+            self._requested_recovery = False
+        elif self.recovery.enabled and not self.eval_mode and not requested:
+            recovery_rows = self._rng.random((ids.numel(),)) < self.recovery.probability
         if self._requested_frames is None:
             frames, bins = sample_start_frames(
                 self.motion,
@@ -334,6 +392,8 @@ class SuperMimicCommand(CommandTerm):
             frames = self._requested_frames
             self._requested_frames = None
             bins = self.motion.frame_bin[frames]
+
+        frames = torch.where(recovery_rows, self.motion.recovery_start, frames)
 
         full_frames = self.f.clone()
         full_frames[ids] = frames
@@ -372,6 +432,40 @@ class SuperMimicCommand(CommandTerm):
                 selected_w,
                 selected_q,
             )
+        recovery_ids = ids[recovery_rows]
+        self.force[ids] = 0
+        self.stable_steps[ids] = 0
+        if recovery_ids.numel():
+            count = recovery_ids.numel()
+            progress = 1.0 if self.eval_mode else self.recovery.progress(self.curriculum_iteration)
+            max_angle = self.recovery.initial_angle + progress * (
+                self.recovery.final_angle - self.recovery.initial_angle
+            )
+            axes = torch.zeros(count, 3, device=self._device)
+            axis_ids = (self._rng.random((count,)) * 2).long()
+            angles = self._rng.uniform(-max_angle, max_angle, (count,))
+            axes[torch.arange(count, device=self._device), axis_ids] = angles
+            rotation[recovery_ids] = so3_exp(axes)
+            p[recovery_ids] = 0
+            q[recovery_ids] = self.default_q[recovery_ids] + self._rng.uniform(
+                -0.15, 0.15, (count, NUM_J)
+            )
+            q[recovery_ids] = q[recovery_ids].clamp(self.kin.q_lo, self.kin.q_hi)
+            v[recovery_ids], w[recovery_ids], qd[recovery_ids] = 0, 0, 0
+            body_p = self.kin.forward(
+                p[recovery_ids],
+                rotation[recovery_ids],
+                v[recovery_ids],
+                w[recovery_ids],
+                q[recovery_ids],
+                qd[recovery_ids],
+                all_bodies=True,
+            )[0]
+            p[recovery_ids, 2] = 0.12 - body_p[..., 2].amin(-1)
+            if not self.eval_mode:
+                self.force[recovery_ids, 2] = self._rng.uniform(
+                    0.0, self.recovery.assistance_max * (1 - progress), (count,)
+                )
         q = torch.clamp(q, self.kin.q_lo, self.kin.q_hi)
         root_state = torch.cat((p + self._env_origins, mat_to_quat(rotation), v, w), dim=-1)
         self.robot.write_motion_state_tensor_to_sim(
@@ -401,9 +495,13 @@ class SuperMimicCommand(CommandTerm):
         reward = cast("RuntimeEnv", self._env).reward_buf
         self.ep_disc_ret.add_(self.gamma ** self.ep_step.float() * reward)
         self.ep_ret.add_(reward)
-        self.f.add_(1)
+        self.f.copy_(self.mdp.advance_frames(self.f))
         self.ep_step.add_(1)
         self.a_prev.copy_(self._env.action_manager.action)
+        if self.recovery.enabled:
+            stable = self.mdp.recovered(self.state()) & self.mdp.recovery_mask(self.f)
+            self.stable_steps.copy_(torch.where(stable, self.stable_steps + 1, 0))
+            self.force.copy_(self.mdp.advance_force(self.f, self.force))
         if self.eval_mode:
             self.last_episode_stats = {}
             return
@@ -414,9 +512,19 @@ class SuperMimicCommand(CommandTerm):
             self.ep_ret,
             self.ep_disc_ret,
             self._env.termination_manager.terminated,
-            self._env.reset_buf,
+            self._env.reset_buf & ~self.mdp.recovery_mask(self.f),
             self.gamma,
         )
+        if self.recovery.enabled:
+            ended = self._env.reset_buf & self.mdp.recovery_mask(self.f)
+            self.last_episode_stats["recovery_success"] = (
+                (
+                    self.stable_steps[ended]
+                    >= max(1, round(self.recovery.stable_seconds / CONTROL_DT))
+                )
+                & (self.f[ended] >= self.motion.recovery_end)
+                & ~self._env.termination_manager.terminated[ended]
+            ).float()
 
     def refresh_reset(self, reset_mask: torch.Tensor) -> None:
         del reset_mask
@@ -506,7 +614,7 @@ def supermimic_reward(env: ManagerBasedRlEnv, command_name: str = "motion") -> t
     command = _command(env, command_name)
     return command.mdp.reward(
         command.state(),
-        command.f + 1,
+        command.mdp.advance_frames(command.f),
         env.action_manager.action,
         command.a_prev,
     )
@@ -514,7 +622,7 @@ def supermimic_reward(env: ManagerBasedRlEnv, command_name: str = "motion") -> t
 
 def supermimic_termination(env: ManagerBasedRlEnv, command_name: str = "motion") -> torch.Tensor:
     command = _command(env, command_name)
-    return command.mdp.termination(command.state(), command.f + 1)
+    return command.mdp.termination(command.state(), command.mdp.advance_frames(command.f))
 
 
 def supermimic_timeout(env: ManagerBasedRlEnv, command_name: str = "motion") -> torch.Tensor:

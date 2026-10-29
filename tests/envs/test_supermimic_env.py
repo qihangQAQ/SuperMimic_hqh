@@ -362,6 +362,8 @@ def test_episode_return_update_without_done_rows_is_a_no_op() -> None:
 def test_eval_command_update_does_not_change_start_bin_statistics() -> None:
     command = object.__new__(SuperMimicCommand)
     command.eval_mode = True
+    command.mdp = SimpleNamespace(advance_frames=lambda frames: frames + 1)
+    command.recovery = SimpleNamespace(enabled=False)
     command.gamma = 0.99
     command.ep_step = torch.tensor([0, 2])
     command.ep_disc_ret = torch.zeros(2)
@@ -782,6 +784,104 @@ def test_eval_reset_to_frames_has_exact_reference_and_zero_dr(
         state = env.step(torch.zeros((2, 29), dtype=torch.float32, device=env.device))
         assert not bool(state.info[SUPERMIMIC_TRANSITION_KEY]["done"].any())
         assert state.info[SUPERMIMIC_STATE_KEY]["f"].tolist() == [1, 52]
+    finally:
+        env.close()
+        env.backend.close()
+
+
+@pytest.mark.slow
+def test_rgmt_recovery_mujoco_training_and_checkpoint(tmp_path: Path) -> None:
+    from unisupermimic.rl.algos.supermimic.learner import SuperMimicConfig, SuperMimicLearner
+    from unisupermimic.tasks.motion_tracking.g1.supermimic.evaluate import load_policy
+
+    cfg = _runtime_cfg(tmp_path, backend="mujoco")
+    command_cfg = cfg.commands["motion"]
+    command_cfg.reference_past = 1
+    command_cfg.goal_frames = 3
+    command_cfg.recovery = dict(
+        enabled=True, probability=1.0, seconds=0.12, stable_seconds=0.02, assistance_max=50.0
+    )
+    # Observation manager and learner must use the same command window.
+    cfg.observations["future"].terms["goal"].params["num_frames"] = 3
+    env = make_supermimic_env(cfg, num_envs=2, backend_type="mujoco")
+    try:
+        train_cfg = SuperMimicConfig(
+            iterations=1,
+            policy_type="rgmt",
+            goal_frames=3,
+            reference_past=1,
+            recovery_enabled=True,
+            attention_dim=16,
+            attention_heads=4,
+            hist=2,
+            horizon=2,
+            wm_window=2,
+            wm_batch=4,
+            pi_batch=4,
+            wm_batches=1,
+            critic_epochs=1,
+            critic_minibatches=1,
+            warmup_steps=3,
+            buffer_steps=16,
+            wm_only_iters=0,
+            compile=False,
+            amp="none",
+            test_hidden_dims=(16,),
+            log_backend="no_print",
+            log_every=1,
+        )
+        learner = SuperMimicLearner(env, train_cfg, tmp_path / "run", device="cpu")
+        learner.collect(4)
+        assert learner.buffer.data["recovery"][:4].all()
+        assert (learner.buffer.data["force"][:4, :, 2] > 0).all()
+        assert all(
+            torch.isfinite(x)
+            for x in (*learner.wm_update(record_diagnostics=True), *learner.policy_update())
+        )
+        assert learner.diagnostics["wm_recovery_fraction"] == 1.0
+        # A resumed curriculum must initialize episodes at the saved progress.
+        command = env._supermimic_command
+        learner.iteration = command.recovery.curriculum_iterations
+        learner.save()
+        checkpoint = torch.load(tmp_path / "run" / "last.pt", weights_only=True)
+        policy = load_policy(env, checkpoint)
+        assert type(policy) is type(learner.pi)
+        learner.load(tmp_path / "run" / "last.pt")
+        assert command.curriculum_iteration == learner.iteration
+        assert not command.force.any()
+        incompatible = dict(checkpoint)
+        incompatible["recovery_config"] = {**checkpoint["recovery_config"], "seconds": 3.0}
+        torch.save(incompatible, tmp_path / "incompatible.pt")
+        with pytest.raises(ValueError, match="recovery_config"):
+            learner.load(tmp_path / "incompatible.pt")
+        # Force remains attached to the correct pre-reset transition.
+        learner.collect(4)
+        assert learner.buffer.size == 8
+        assert torch.isfinite(learner.buffer.data["s1"][:8]).all()
+        # Compare identical initial states under a real force, not just logged metadata.
+        command = env._supermimic_command
+        command.eval_mode = True
+        command.reset_noise = False
+        env.reset_to_frames(torch.zeros(2, dtype=torch.long))
+        env.set_external_force(torch.tensor([[0.0, 0.0, 100.0], [0.0, 0.0, 0.0]]))
+        step = env.step(torch.zeros(2, 29))
+        transition = step.info[SUPERMIMIC_TRANSITION_KEY]
+        assert transition["s1"][0, 9] > transition["s1"][1, 9]  # world vertical velocity
+        torch.testing.assert_close(transition["force"][:, 2], torch.tensor([100.0, 0.0]))
+        # A push lasts one control step and cannot leak across an explicit reset.
+        next_step = env.step(torch.zeros(2, 29))
+        assert not next_step.info[SUPERMIMIC_TRANSITION_KEY]["force"].any()
+        env.set_external_force(torch.full((2, 3), 100.0))
+        env.reset_to_frames(torch.zeros(2, dtype=torch.long))
+        next_step = env.step(torch.zeros(2, 29))
+        assert not next_step.info[SUPERMIMIC_TRANSITION_KEY]["force"].any()
+        # Recovery evaluation must explicitly disable assistance and be reproducible.
+        from unisupermimic.tasks.motion_tracking.g1.supermimic.evaluate import evaluate_recovery
+
+        first = evaluate_recovery(env, checkpoint, seed=7)
+        second = evaluate_recovery(env, checkpoint, seed=7)
+        assert first == second
+        assert first["assistance"] is False and first["trials"] == 2
     finally:
         env.close()
         env.backend.close()

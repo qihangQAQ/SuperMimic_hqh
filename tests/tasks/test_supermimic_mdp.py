@@ -272,3 +272,51 @@ def test_perfect_tracking_reward_and_termination(library) -> None:
         ]
     )
     assert mdp.termination(tilt_state, frames).tolist() == [False, True, False, False]
+
+
+def test_local_window_does_not_cross_clips(library) -> None:
+    _, motion, _ = library
+    frames = torch.tensor([0, 101, 102, 108])
+    window = motion.window_frames(frames, 2, 5)
+    assert window.tolist() == [
+        [0, 0, 0, 1, 2],
+        [99, 100, 101, 101, 101],
+        [102, 102, 102, 103, 104],
+        [106, 107, 108, 108, 108],
+    ]
+    goal = motion.window_goal(frames, 2, 5).view(4, 5, 73)
+    torch.testing.assert_close(goal[:, 2, :3], torch.zeros(4, 3))
+    torch.testing.assert_close(goal[:, 2, 15:44], motion.q[frames])
+
+
+def test_recovery_reference_deadline_and_soft_termination(library) -> None:
+    import copy
+
+    from unisupermimic.tasks.motion_tracking.g1.supermimic.recovery import RecoveryConfig
+
+    kin, original, base = library
+    motion = copy.deepcopy(original)
+    mdp = MDP(
+        kin,
+        motion,
+        base.default_q,
+        recovery=RecoveryConfig(enabled=True, seconds=0.1, stable_seconds=0.02),
+    )
+    start, end = motion.recovery_start, motion.recovery_end
+    assert end - start == 5
+    assert motion.num_bins == original.num_bins
+    assert motion.num_tracking_clips == 2
+    assert motion.frame_bin[start:].eq(-1).all()
+    assert motion.qd[start:].eq(0).all() and motion.root_v[start:].eq(0).all()
+    frames = torch.tensor([start, end - 1, end])
+    state = tuple(value.clone() for value in motion.ref_state(frames))
+    state[0][:, 2] = 0.1
+    assert not mdp.termination(state, frames).any()
+    torch.testing.assert_close(mdp.soft_termination(state, frames), torch.tensor([0.0, 0.0, 1.0]))
+    assert mdp.advance_frames(frames).tolist() == [start + 1, end, end]
+    assert mdp.valid_imagination_start(frames, 32).tolist() == [True, True, False]
+    force = torch.tensor([[0.0, 0.0, 100.0]]).expand(3, -1)
+    torch.testing.assert_close(mdp.advance_force(frames, force)[-1], torch.zeros(3))
+    torch.testing.assert_close(
+        mdp.task_features(frames, force)[:, 1], torch.tensor([1.0, 0.2, 0.0])
+    )

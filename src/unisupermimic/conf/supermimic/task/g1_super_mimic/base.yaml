@@ -74,7 +74,7 @@ env:
       terms:
         goal:
           func: unisupermimic.tasks.motion_tracking.g1.supermimic.manager_terms.supermimic_goal
-          params: {command_name: motion, num_frames: 10}
+          params: {command_name: motion, num_frames: "${algo.goal_frames}"}
   actions:
     joint_pos:
       _target_: unisupermimic.tasks.motion_tracking.g1.supermimic.manager_terms.SuperMimicActionCfg
@@ -90,7 +90,23 @@ env:
       src_fps: 30.0
       reset_noise: true
       max_episode_steps: 500
-      goal_frames: 10
+      goal_frames: ${algo.goal_frames}
+      reference_past: ${algo.reference_past}
+      recovery:
+        enabled: ${algo.recovery_enabled}
+        probability: 0.15
+        seconds: 3.0
+        stand_height: 0.76
+        assistance_max: 200.0
+        curriculum_iterations: 6000
+        initial_angle: 0.4
+        final_angle: 3.141592653589793
+        height_tolerance: 0.12
+        tilt_tolerance: 0.3
+        joint_tolerance: 0.5
+        velocity_tolerance: 0.5
+        stable_seconds: 0.3
+        shaping_weight: 0.0
       context_dim: 33
       resampling_time_range: [1.0e9, 1.0e9]
       motion_files:

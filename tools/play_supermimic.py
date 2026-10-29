@@ -3,6 +3,8 @@
 Run from the repository root, for example:
     uv run --no-sync tools/play_supermimic.py --ckpt runs/RUN/ckpt_012000.pt --loop
 
+For an external G1 CSV, add --motion-file path/to/motion.csv --motion-fps 60.
+
 The viewer displays the live physics rollout. Mouse perturbations affect only
 the display model, not the policy's simulation. Close the window or press
 Ctrl+C in the terminal to stop.
@@ -175,7 +177,13 @@ def play(rollout: PolicyRollout, *, loop: bool, speed: float, align_reference: b
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ckpt", type=Path, required=True)
-    parser.add_argument("--clip", default="walk1_subject1")
+    parser.add_argument(
+        "--clip", help="Clip name; defaults to the external CSV stem or walk1_subject1"
+    )
+    parser.add_argument("--motion-file", type=Path, help="External G1 motion CSV (36 columns)")
+    parser.add_argument(
+        "--motion-fps", type=float, help="Source CSV frame rate; required with --motion-file"
+    )
     parser.add_argument("--backend", choices=SUPPORTED_BACKENDS, default="mujoco")
     parser.add_argument(
         "--device",
@@ -193,6 +201,20 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if not args.ckpt.is_file():
         parser.error(f"Checkpoint not found: {args.ckpt}")
+    if args.motion_file is not None:
+        if not args.motion_file.is_file():
+            parser.error(f"Motion CSV not found: {args.motion_file}")
+        if args.motion_fps is None:
+            parser.error(
+                "--motion-file requires --motion-fps (the CSV does not store its frame rate)"
+            )
+        if args.clip is not None and args.clip != args.motion_file.stem:
+            parser.error("--clip must match the filename without .csv when using --motion-file")
+    elif args.motion_fps is not None:
+        parser.error("--motion-fps requires --motion-file")
+    if args.motion_fps is not None and (not math.isfinite(args.motion_fps) or args.motion_fps <= 0):
+        parser.error("--motion-fps must be finite and positive")
+    clip = args.clip or (args.motion_file.stem if args.motion_file else "walk1_subject1")
     if not math.isfinite(args.speed) or args.speed <= 0:
         parser.error("--speed must be finite and positive")
     if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
@@ -206,7 +228,14 @@ def main(argv: list[str] | None = None) -> None:
     env = None
     try:
         print(f"Loading local motion assets ({args.backend})...", flush=True)
-        env = make_eval_env(args.ckpt.parent, backend=args.backend, num_envs=1, device=device)
+        env = make_eval_env(
+            args.ckpt.parent,
+            backend=args.backend,
+            num_envs=1,
+            device=device,
+            motion_files=[str(args.motion_file.resolve())] if args.motion_file else None,
+            src_fps=args.motion_fps,
+        )
         print(f"Loading policy on {env.device}...", flush=True)
         checkpoint = torch.load(args.ckpt, map_location=env.device, weights_only=True)
         with policy_load_dim_guard(
@@ -214,7 +243,7 @@ def main(argv: list[str] | None = None) -> None:
             env_action_dim=env.action_manager.total_action_dim,
             algo_name="supermimic",
         ):
-            rollout = PolicyRollout(env, checkpoint, args.clip)
+            rollout = PolicyRollout(env, checkpoint, clip)
         play(rollout, loop=args.loop, speed=args.speed, align_reference=args.align_reference)
     except KeyboardInterrupt:
         pass

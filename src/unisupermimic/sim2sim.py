@@ -14,7 +14,28 @@ from unilab.utils.sim2sim import (
     policy_load_dim_guard,
 )
 
+OPTIONAL_DEFAULTS: dict[str, Any] = {
+    "algo.policy_io_version": 1,
+    "algo.policy_type": "mlp",
+    "algo.reference_past": -1,
+    "algo.attention_dim": 128,
+    "algo.attention_heads": 4,
+    "algo.attention_layers": 1,
+    "algo.proprio_dim": 93,
+    "algo.recovery_enabled": False,
+    "env.commands.motion.reference_past": -1,
+    "env.commands.motion.recovery": {"enabled": False},
+}
+
+
+def _optional_default(path: str, value: Any) -> bool:
+    if path == "env.commands.motion.recovery":
+        return value is None or not value.get("enabled", False)
+    return path in OPTIONAL_DEFAULTS and (value is None or value == OPTIONAL_DEFAULTS[path])
+
+
 SUPERMIMIC_DENYLIST = [
+    *OPTIONAL_DEFAULTS,
     "algo.goal_frames",
     "algo.hist",
     "algo.z_dim",
@@ -58,6 +79,8 @@ def extract_contract_snapshot(full_cfg: DictConfig) -> dict[str, Any]:
     snapshot: dict[str, Any] = {}
     for path in SNAPSHOT_FIELDS:
         value = _select(cfg, path)
+        if _optional_default(path, value):
+            continue
         if value is not None:
             snapshot[path] = _to_plain(value)
     return snapshot
@@ -145,6 +168,7 @@ def resolve_sim2sim_config(
     *,
     algo_name: str | None = None,
     strict: bool = True,
+    allow_motion_override: bool = False,
 ) -> DictConfig | None:
     del algo_name
     if source_run_dir is None:
@@ -161,6 +185,8 @@ def resolve_sim2sim_config(
 
     denials: list[str] = []
     for path, source_value in snapshot.items():
+        if allow_motion_override and path == "env.commands.motion.motion_files":
+            continue
         target_value = _select(target_cfg, path)
         if target_value is None:
             if path in ENV_STRUCTURAL_DENYLIST:
@@ -176,9 +202,11 @@ def resolve_sim2sim_config(
         else:
             print(f"[sim2sim] WARNING override {line}")
 
-    for path in ENV_STRUCTURAL_DENYLIST:
+    for path in dict.fromkeys([*ENV_STRUCTURAL_DENYLIST, *OPTIONAL_DEFAULTS]):
         if path not in snapshot:
             target_value = _select(target_cfg, path)
+            if _optional_default(path, target_value):
+                continue
             if target_value is not None:
                 denials.append(_asymmetric_line(path, target_value, source_present=False))
 

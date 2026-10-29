@@ -51,6 +51,22 @@ class SuperMimicManagerBasedRlEnv(ManagerBasedRlEnv):
             raise ValueError("SuperMimic requires exactly one SuperMimicCommand term")
         self._supermimic_command = commands[0]
         self._pre_action: dict[str, Any] | None = None
+        self._external_force = torch.zeros(num_envs, 3, device=self.device)
+        self._external_force_pending = False
+
+    def set_curriculum_iteration(self, iteration: int) -> None:
+        self._supermimic_command.curriculum_iteration = iteration
+
+    def set_external_force(self, force: torch.Tensor) -> None:
+        """World-frame pelvis COM force for the next complete control step only."""
+        if force.shape != self._external_force.shape or not bool(force.isfinite().all()):
+            raise ValueError("external force must be finite with shape (num_envs, 3)")
+        self._external_force.copy_(force)
+        self._external_force_pending = True
+
+    def reset_to_recovery(self, seed: int = 0) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+        self._supermimic_command.request_recovery()
+        return self.reset(seed=seed)
 
     @property
     def supermimic_mdp(self) -> SuperMimicMdpProtocol:
@@ -58,6 +74,13 @@ class SuperMimicManagerBasedRlEnv(ManagerBasedRlEnv):
 
     def apply_action(self, actions: torch.Tensor, state: TorchEnvState) -> torch.Tensor:
         command = self._supermimic_command
+        force = command.force
+        if self._external_force_pending:
+            force = force + self._external_force
+        command.apply_force(force, external=self._external_force_pending)
+        if self._external_force_pending:
+            self._external_force.zero_()
+            self._external_force_pending = False
         self._pre_action = {
             "state": tuple(value.detach().clone() for value in command.state()),
             "frames": command.f.detach().clone(),
@@ -66,6 +89,8 @@ class SuperMimicManagerBasedRlEnv(ManagerBasedRlEnv):
             "ep_step": command.ep_step.detach().clone(),
             "action": actions.detach().clone(),
         }
+        if command.recovery.enabled:
+            self._pre_action["force"] = force.detach().clone()
         return super().apply_action(actions, state)
 
     def _update_state_in_read_phase(self, state: TorchEnvState) -> TorchEnvState:
@@ -86,6 +111,12 @@ class SuperMimicManagerBasedRlEnv(ManagerBasedRlEnv):
             updated.truncated,
         )
         transition.update(command.last_episode_stats)
+        if command.recovery.enabled:
+            transition["force"] = self._pre_action["force"]
+            transition["recovery"] = command.mdp.recovery_mask(self._pre_action["frames"])
+            transition["recovery_end"] = transition["recovery"] & (
+                self._pre_action["frames"] + 1 >= command.motion.recovery_end
+            )
         updated.info[SUPERMIMIC_TRANSITION_KEY] = transition
         updated.info[SUPERMIMIC_STATE_KEY] = self._current_info()
         self._pre_action = None
@@ -93,13 +124,16 @@ class SuperMimicManagerBasedRlEnv(ManagerBasedRlEnv):
 
     def _current_info(self) -> dict[str, torch.Tensor]:
         command = self._supermimic_command
-        return make_current_info(
+        info = make_current_info(
             command.state(),
             command.f,
             command.xi,
             command.a_prev,
             command.ep_step,
         )
+        if command.recovery.enabled:
+            info["force"] = command.force.detach().clone()
+        return info
 
     def reset(
         self,
@@ -119,6 +153,9 @@ class SuperMimicManagerBasedRlEnv(ManagerBasedRlEnv):
             )
             reset_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
             reset_mask[ids] = True
+        self._external_force[reset_mask] = 0
+        if env_ids is None:
+            self._external_force_pending = False
         obs, info = super().reset(env_ids, seed=seed, options=options)
         assert self._state is not None
         current = self._current_info()

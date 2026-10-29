@@ -85,6 +85,8 @@ uv run tools/prepare_supermimic_assets.py --validate-only
 
 ## 训练
 
+RGMT 融合版本支持可选的时序编码、cross-attention 和恢复课程，见 [RGMT 训练与评估](docs/rgmt_usage.md)。使用 `experiment=rgmt` 训练编码器版本，使用 `experiment=rgmt_recovery` 训练完整融合版本。
+
 以下命令从仓库根目录运行；使用 CUDA 时，把 `CUDA_VISIBLE_DEVICES` 改为实际空闲 GPU。
 
 ```bash

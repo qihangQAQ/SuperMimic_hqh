@@ -85,6 +85,8 @@ Assets come from `lvhaidong/LAFAN1_Retargeting_Dataset`. A complete asset set co
 
 ## Training
 
+The optional RGMT integration adds a causal history encoder, cross-attention, and a recovery curriculum. Use `experiment=rgmt` for the encoder variant or `experiment=rgmt_recovery` for the combined variant. See the [training and evaluation guide (Chinese)](docs/rgmt_usage.md).
+
 Run the following commands from the repository root and set `CUDA_VISIBLE_DEVICES` to an available GPU when using CUDA.
 
 ```bash

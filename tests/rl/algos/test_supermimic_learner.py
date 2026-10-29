@@ -375,3 +375,33 @@ def test_no_print_backend_writes_no_events(tmp_path) -> None:
     learner.train()
 
     assert not list(tmp_path.glob("events.out.tfevents.*"))
+
+
+def test_rgmt_learner_updates_and_rejects_wrong_checkpoint_kind(tmp_path) -> None:
+    env = FakeEnv()
+    env.mdp.reference_past = 0
+    cfg = replace(
+        _config(),
+        policy_type="rgmt",
+        reference_past=0,
+        proprio_dim=6,
+        attention_dim=8,
+        attention_heads=2,
+    )
+    learner = SuperMimicLearner(env, cfg, tmp_path / "rgmt")
+    learner.train()
+    assert learner.pi.cross.q.weight.grad is not None
+    baseline = SuperMimicLearner(FakeEnv(), _config(), tmp_path / "baseline")
+    with pytest.raises(ValueError, match="policy_type"):
+        baseline.load(tmp_path / "rgmt" / "last.pt")
+
+
+def test_no_valid_imagination_starts_raises_instead_of_hanging(tmp_path) -> None:
+    env = FakeEnv()
+    env.mdp.valid_imagination_start = lambda frames, horizon: torch.zeros_like(
+        frames, dtype=torch.bool
+    )
+    learner = SuperMimicLearner(env, _config(), tmp_path)
+    learner.collect(3)
+    with pytest.raises(ValueError, match="insufficient valid imagination starts"):
+        learner.policy_update()

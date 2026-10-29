@@ -50,7 +50,8 @@ def test_comparison_frame_preserves_shape_and_adds_labels() -> None:
     assert not np.array_equal(frame, image)
 
 
-def test_rollout_qpos_trims_continuous_rollout(monkeypatch) -> None:
+@pytest.mark.parametrize("recovery", [False, True])
+def test_rollout_qpos_trims_continuous_rollout(monkeypatch, recovery: bool) -> None:
     from types import SimpleNamespace
 
     num_frames = 200
@@ -63,6 +64,10 @@ def test_rollout_qpos_trims_continuous_rollout(monkeypatch) -> None:
         root_R=torch.eye(3).expand(num_frames, 3, 3),
         q=torch.zeros(num_frames, 29),
     )
+    if recovery:
+        motion.num_tracking_clips = 1
+        motion.names.append("__recovery_stand__")
+        motion.clip_start = torch.tensor([0, 199])
 
     class FakeMdp:
         def __init__(self) -> None:
@@ -92,6 +97,7 @@ def test_rollout_qpos_trims_continuous_rollout(monkeypatch) -> None:
             }
 
         def reset_to_frames(self, frames):
+            assert frames.shape == (1,)
             self.current = self._current(frames)
             return {}, {render.SUPERMIMIC_STATE_KEY: self.current}
 

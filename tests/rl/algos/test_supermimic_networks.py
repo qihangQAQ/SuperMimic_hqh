@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import warnings
 
+import pytest
 import torch
 
 from unisupermimic.rl.algos.supermimic import networks
 from unisupermimic.rl.algos.supermimic.networks import (
     Critic,
     Policy,
+    RGMTPolicy,
     RunningNorm,
     WorldModel,
+    make_policy,
     mlp,
     run_mlp,
 )
@@ -151,3 +154,58 @@ def test_run_mlp_autocasts_on_mps() -> None:
         torch.testing.assert_close(out.cpu(), net.cpu()(x.cpu()), rtol=2e-2, atol=2e-3)
     finally:
         networks.AMP_DTYPE = previous
+
+
+def test_rgmt_history_is_causal_and_ignores_reference_orientation() -> None:
+    policy = RGMTPolicy(99, 73, 5, hist=4, hidden=(16,), width=16, heads=4, reference_past=2)
+    obs = torch.randn(2, 4, 99)
+    original = policy.encode_history(obs)
+    altered = obs.clone()
+    altered[:, 2:, :93] += 10
+    altered[..., 93:] += 50
+    changed = policy.encode_history(altered)
+    torch.testing.assert_close(original[:, :2], changed[:, :2])
+    assert not torch.allclose(original[:, 2:], changed[:, 2:])
+
+
+def test_rgmt_gradients_flow_through_frozen_world_model() -> None:
+    policy = RGMTPolicy(99, 73, 3, hist=3, hidden=(16,), width=16, heads=4, reference_past=1)
+    wm = WorldModel(hidden=(16,), force_dim=3)
+    # Identity output initialization has zero action derivative until model fitting.
+    torch.nn.init.normal_(wm.net[-1].weight, std=0.01)
+    wm.requires_grad_(False)
+    obs = torch.randn(2, 3, 99, requires_grad=True)
+    goal = torch.randn(2, 3 * 73, requires_grad=True)
+    policy.update_goal_norm(goal.detach())
+    state = _state(2, 29)
+    action = policy(obs, goal)
+    predicted = wm.step(state, action, torch.zeros(2, 33), torch.zeros(2, 3))
+    predicted[4].square().mean().backward()
+    assert obs.grad is not None and obs.grad.abs().sum() > 0
+    assert goal.grad is not None and goal.grad.abs().sum() > 0
+    assert policy.cross.q.weight.grad is not None
+    assert policy.cross.q.weight.grad.abs().sum() > 0
+    assert all(parameter.grad is None for parameter in wm.parameters())
+    policy.eval()
+    with torch.no_grad():
+        torch.testing.assert_close(policy(obs.detach(), goal.detach()), action.detach())
+
+
+def test_world_model_force_is_body_relative_and_required() -> None:
+    wm = WorldModel(hidden=(8,), num_joints=2, context_dim=1, force_dim=3)
+    state = list(_state(1, 2))
+    state[1] = torch.tensor([[[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]])
+    inputs = wm.inputs(
+        tuple(state), torch.zeros(1, 2), torch.zeros(1, 1), torch.tensor([[200.0, 0.0, 0.0]])
+    )
+    torch.testing.assert_close(inputs[:, -3:], torch.tensor([[0.0, -1.0, 0.0]]))
+    with pytest.raises(ValueError, match="recorded force"):
+        wm.step(tuple(state), torch.zeros(1, 2), torch.zeros(1, 1))
+
+
+def test_policy_factory_loads_legacy_and_rejects_unknown_type() -> None:
+    legacy = Policy(6, 6, hist=2, z_dim=3, num_joints=2, hidden=(8,))
+    loaded = make_policy(6, 3, 2, dict(hist=2, goal_frames=2, z_dim=3, policy_hidden=[8]))
+    loaded.load_state_dict(legacy.state_dict())
+    with pytest.raises(ValueError, match="unknown policy_type"):
+        make_policy(6, 3, 2, {"policy_type": "unknown"})

@@ -1,6 +1,7 @@
 defaults:
   - _self_
   - task: g1_super_mimic/mjwarp
+  - experiment: null
 
 algo:
   algo: supermimic
@@ -40,6 +41,14 @@ algo:
   amp: bf16
   compile: true
   test_hidden_dims: null
+  policy_type: mlp
+  policy_io_version: 1
+  reference_past: -1
+  attention_dim: 128
+  attention_heads: 4
+  attention_layers: 1
+  proprio_dim: 93
+  recovery_enabled: false
 
 training:
   task_name: G1SuperMimic
@@ -52,6 +61,8 @@ training:
   play_env_num: 40
   log_root: null
   log_dir: null
+  motion_manifest: null
+  motion_split: train
 
 hydra:
   run:

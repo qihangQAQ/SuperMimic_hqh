@@ -37,6 +37,11 @@ class MotionLib:
             raise ValueError("MotionLib requires at least one CSV file")
         self.device = torch.device(device)
         self.names = [os.path.splitext(os.path.basename(file))[0] for file in files]
+        if len(set(self.names)) != len(self.names) or "__recovery_stand__" in self.names:
+            raise ValueError("motion basenames must be unique and cannot use __recovery_stand__")
+        self.num_tracking_clips = len(files)
+        self.recovery_start = -1
+        self.recovery_end = -1
         positions, quaternions, joint_positions = [], [], []
         lengths = []
         for file in files:
@@ -155,6 +160,21 @@ class MotionLib:
     def goal(self, frames: torch.Tensor, num_frames: int) -> torch.Tensor:
         """Build future reference features in the current reference heading frame."""
         future = self.future_frames(frames, num_frames)
+        return self._goal_features(frames, future)
+
+    def window_frames(self, frames: torch.Tensor, past: int, count: int) -> torch.Tensor:
+        if not 0 <= past < count:
+            raise ValueError("reference_past must be nonnegative and smaller than goal_frames")
+        clips = self.clip_id[frames]
+        indices = frames.unsqueeze(-1) + torch.arange(-past, count - past, device=frames.device)
+        return indices.clamp(
+            self.clip_start[clips].unsqueeze(-1), self.clip_end[clips].unsqueeze(-1)
+        )
+
+    def window_goal(self, frames: torch.Tensor, past: int, count: int) -> torch.Tensor:
+        return self._goal_features(frames, self.window_frames(frames, past, count))
+
+    def _goal_features(self, frames: torch.Tensor, future: torch.Tensor) -> torch.Tensor:
         heading = yaw_mat(self.root_R[frames])
         heading_t = heading.transpose(-1, -2).unsqueeze(1)
         position_delta = (
@@ -173,6 +193,58 @@ class MotionLib:
             -1,
         )
         return features.reshape(frames.shape[0], -1)
+
+    def add_standing_reference(
+        self,
+        kin: G1Kinematics,
+        joint_pos: torch.Tensor,
+        height: float,
+        steps: int,
+    ) -> None:
+        """Append a stationary recovery reference, excluded from motion sampling bins."""
+        if self.recovery_start >= 0:
+            raise ValueError("standing reference already exists")
+        length = steps + 1
+        p = torch.zeros(length, 3, device=self.device)
+        p[:, 2] = height
+        rotation = torch.eye(3, device=self.device).expand(length, 3, 3)
+        velocity = torch.zeros_like(p)
+        q = joint_pos.expand(length, -1)
+        qd = torch.zeros_like(q)
+        body_p, body_R, body_v, body_w = kin.forward(p, rotation, velocity, velocity, q, qd)
+        values = dict(
+            root_p=p,
+            root_R=rotation,
+            root_v=velocity,
+            root_w=velocity,
+            q=q,
+            qd=qd,
+            body_p=body_p,
+            body_R=body_R,
+            body_v=body_v,
+            body_w=body_w,
+            root_v_local=velocity,
+            root_w_local=velocity,
+            root_gz=torch.ones(length, device=self.device),
+        )
+        for name, value in values.items():
+            setattr(self, name, torch.cat((getattr(self, name), value)))
+        self.recovery_start = self.num_frames
+        self.recovery_end = self.num_frames + steps
+        self.clip_id = torch.cat(
+            (
+                self.clip_id,
+                torch.full((length,), len(self.names), device=self.device, dtype=torch.long),
+            )
+        )
+        self.clip_start = torch.cat(
+            (self.clip_start, self.clip_start.new_tensor([self.recovery_start]))
+        )
+        self.clip_end = torch.cat((self.clip_end, self.clip_end.new_tensor([self.recovery_end])))
+        self.clip_len = torch.cat((self.clip_len, self.clip_len.new_tensor([length])))
+        self.frame_bin = torch.cat((self.frame_bin, self.frame_bin.new_full((length,), -1)))
+        self.names.append("__recovery_stand__")
+        self.num_frames += length
 
     def ref_state(self, frames: torch.Tensor) -> State:
         return (

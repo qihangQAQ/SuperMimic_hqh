@@ -17,6 +17,7 @@ from unilab.rl.contracts.env import EnvProtocol
 from unisupermimic.rl.contracts.supermimic import (
     SUPERMIMIC_STATE_KEY,
     SUPERMIMIC_TRANSITION_KEY,
+    RecoveryMdpProtocol,
     State,
     get_supermimic_mdp,
 )
@@ -24,7 +25,7 @@ from unisupermimic.rl.logging import SuperMimicLogger
 
 from . import networks
 from .geometry import unflatten_state
-from .networks import Critic, Policy, WorldModel, mlp
+from .networks import Critic, Policy, RGMTPolicy, WorldModel, make_policy, mlp
 from .replay import ReplayBuffer
 
 
@@ -61,6 +62,14 @@ class SuperMimicConfig:
     amp: str = "bf16"
     compile: bool = True
     test_hidden_dims: tuple[int, ...] | None = None
+    policy_type: str = "mlp"
+    reference_past: int = -1
+    attention_dim: int = 128
+    attention_heads: int = 4
+    attention_layers: int = 1
+    proprio_dim: int = 93
+    recovery_enabled: bool = False
+    policy_io_version: int = 1
 
 
 _LOG_FIELDS = (
@@ -122,6 +131,16 @@ class SuperMimicLearner:
         self._bridged = self.device != self.env_device
         mdp = get_supermimic_mdp(env)
         self.mdp = mdp.to(self.device) if self._bridged else mdp
+        self.recovery_mdp: RecoveryMdpProtocol | None = None
+        if cfg.recovery_enabled:
+            if not isinstance(self.mdp, RecoveryMdpProtocol) or self.mdp.force_dim != 3:
+                raise ValueError("recovery learner requires a force-conditioned recovery MDP")
+            self.recovery_mdp = self.mdp
+        elif getattr(self.mdp, "force_dim", 0):
+            raise ValueError("environment recovery requires algo.recovery_enabled=true")
+        if getattr(self.mdp, "reference_past", -1) != cfg.reference_past:
+            raise ValueError("learner and environment reference_past must match")
+        self.diagnostics: dict[str, float | None] = {}
 
         # TF32 only pays off for fp32 (amp="none") training: under bf16 autocast
         # the heavy GEMMs already run in bf16, while on ROCm a TF32 bmm over the
@@ -149,6 +168,7 @@ class SuperMimicLearner:
             self.device,
             num_joints=self.mdp.num_joints,
             context_dim=self.mdp.context_dim,
+            force_dim=3 if cfg.recovery_enabled else 0,
         )
         self.obs_hist = torch.zeros(env.num_envs, cfg.hist, self.mdp.obs_dim, device=self.device)
         self.err_floor = torch.cat(
@@ -188,37 +208,16 @@ class SuperMimicLearner:
         kwargs = {
             "num_joints": self.mdp.num_joints,
             "context_dim": self.mdp.context_dim,
+            "force_dim": 3 if self.cfg.recovery_enabled else 0,
         }
         if self.cfg.test_hidden_dims is not None:
             return WorldModel(hidden=self.cfg.test_hidden_dims, **kwargs)
         return WorldModel(hidden=self.cfg.wm_hidden, **kwargs)
 
-    def _make_policy(self) -> Policy:
-        goal_dim = self.mdp.goal_frame_dim * self.cfg.goal_frames
-        policy = Policy(
-            self.mdp.obs_dim,
-            goal_dim,
-            hist=self.cfg.hist,
-            z_dim=self.cfg.z_dim,
-            num_joints=self.mdp.num_joints,
-            hidden=self.cfg.policy_hidden,
+    def _make_policy(self) -> Policy | RGMTPolicy:
+        return make_policy(
+            self.mdp.obs_dim, self.mdp.goal_frame_dim, self.mdp.num_joints, asdict(self.cfg)
         )
-        if self.cfg.test_hidden_dims is not None:
-            enc_output = policy.enc[-1]
-            assert isinstance(enc_output, nn.Linear)
-            z_dim = enc_output.out_features
-            policy.enc = mlp(goal_dim, self.cfg.test_hidden_dims, z_dim)
-            policy.dec = mlp(
-                z_dim + self.mdp.obs_dim * self.cfg.hist,
-                self.cfg.test_hidden_dims,
-                self.mdp.num_joints,
-            )
-            dec_output = policy.dec[-1]
-            assert isinstance(dec_output, nn.Linear)
-            with torch.no_grad():
-                dec_output.weight.mul_(0.01)
-                dec_output.bias.zero_()
-        return policy
 
     def _state_info(self) -> dict[str, torch.Tensor]:
         state = self.env.state
@@ -237,10 +236,18 @@ class SuperMimicLearner:
                 info["f"],
                 self.mdp.normalize_context(info["xi"]),
             )
-        return int(features.shape[-1] + self.mdp.goal_frame_dim * self.cfg.goal_frames)
+        return int(
+            features.shape[-1]
+            + self.mdp.goal_frame_dim * self.cfg.goal_frames
+            + (5 if self.cfg.recovery_enabled else 0)
+        )
 
     def _wm_rollout(
-        self, states: torch.Tensor, actions: torch.Tensor, contexts: torch.Tensor
+        self,
+        states: torch.Tensor,
+        actions: torch.Tensor,
+        contexts: torch.Tensor,
+        forces: torch.Tensor | None = None,
     ) -> State:
         state = unflatten_state(states[:, 0])
         predictions = []
@@ -249,6 +256,7 @@ class SuperMimicLearner:
                 state,
                 actions[:, index],
                 self.mdp.normalize_context(contexts[:, index]),
+                forces[:, index] if forces is not None else None,
             )
             predictions.append(state)
         return (
@@ -277,14 +285,22 @@ class SuperMimicLearner:
         context: torch.Tensor,
         normalized_context: torch.Tensor,
         goal: torch.Tensor,
-    ) -> tuple[State, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        force: torch.Tensor | None = None,
+    ) -> tuple[State, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         action = self.pi(obs_hist, goal)
-        next_state = self.wm.step(state, action, normalized_context)
-        next_frames = frames + 1
+        next_state = self.wm.step(state, action, normalized_context, force)
+        next_frames = (
+            self.recovery_mdp.advance_frames(frames)
+            if self.recovery_mdp is not None
+            else frames + 1
+        )
+        if self.recovery_mdp is not None:
+            assert force is not None
+            force = self.recovery_mdp.advance_force(next_frames, force)
         obs = self.mdp.add_noise(self.mdp.obs(next_state, action, context, next_frames))
         next_hist = torch.cat((obs_hist[:, 1:], obs.unsqueeze(1)), 1)
         next_goal = self.mdp.goal(next_frames, self.cfg.goal_frames)
-        return next_state, action, next_hist, next_frames, next_goal
+        return next_state, action, next_hist, next_frames, next_goal, force
 
     def _reward_term(
         self,
@@ -303,11 +319,21 @@ class SuperMimicLearner:
         frames: torch.Tensor,
         normalized_context: torch.Tensor,
         goal: torch.Tensor,
+        force: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return torch.cat((self.mdp.critic_features(state, frames, normalized_context), goal), -1)
+        parts = [self.mdp.critic_features(state, frames, normalized_context), goal]
+        if self.recovery_mdp is not None:
+            assert force is not None
+            parts.append(self.recovery_mdp.task_features(frames, force))
+        return torch.cat(parts, -1)
 
     @torch.no_grad()
     def collect(self, n_steps: int) -> None:
+        if self.cfg.recovery_enabled:
+            setter = getattr(self.env, "set_curriculum_iteration", None)
+            if setter is None:
+                raise TypeError("recovery environment must expose set_curriculum_iteration")
+            setter(self.iteration)
         for _ in range(n_steps):
             info = self._state_info()
             state = unflatten_state(info["s"])
@@ -319,7 +345,7 @@ class SuperMimicLearner:
             )
             goal = self.mdp.goal(info["f"], self.cfg.goal_frames)
             self.pi.obs_norm.update(obs)
-            self.pi.goal_norm.update(goal)
+            self.pi.update_goal_norm(goal)
             action = self.pi(self.obs_hist, goal)
             action = torch.clamp(action + self.cfg.action_noise * torch.randn_like(action), -20, 20)
             if self._bridged:
@@ -337,20 +363,23 @@ class SuperMimicLearner:
                     initial,
                     transition["a"],
                     self.mdp.normalize_context(transition["xi"]),
+                    transition.get("force"),
                 )
             )
             self.wm.out_norm.update(self.wm.targets(initial, next_state))
             self.sim_steps += self.env.num_envs
             self.stats["r"].append(transition["r"].mean() / self.mdp.max_step_reward)
+            if "recovery_success" in transition and transition["recovery_success"].numel():
+                self.diagnostics["recovery_success"] = float(transition["recovery_success"].mean())
             if "ep_len" in transition:
                 self.stats["ep_len"].append(transition["ep_len"].mean())
                 self.stats["ep_ret"].append(transition["ep_ret_norm"].mean())
                 self.stats["term"].append(transition["term"].float().sum())
                 self.stats["done"].append(transition["done"].float().sum())
 
-    def wm_update(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def wm_update(self, *, record_diagnostics: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
         window = self.buffer.sample_windows(self.cfg.wm_batch, self.cfg.wm_window)
-        predicted = self._wm_rollout_fn(window["s"], window["a"], window["xi"])
+        predicted = self._wm_rollout_fn(window["s"], window["a"], window["xi"], window.get("force"))
         loss, last_error = self._wm_err_fn(predicted, window["s1"], window["mask"])
         self.opt_wm.zero_grad(set_to_none=True)
         loss.backward()
@@ -358,6 +387,35 @@ class SuperMimicLearner:
         self.opt_wm.step()
         mask = window["mask"][:, -1]
         mean_last_error = (last_error.detach() * mask).sum() / mask.sum().clamp(min=1)
+        if record_diagnostics and "recovery" in window:
+            with torch.no_grad():
+                errors = (
+                    (
+                        self.wm.state_error(predicted, unflatten_state(window["s1"]))
+                        / torch.maximum(self.wm.out_norm.std(), self.err_floor)
+                    )
+                    .square()
+                    .mean(-1)
+                )
+                for name, group in (
+                    ("tracking", ~window["recovery"]),
+                    ("recovery", window["recovery"]),
+                    ("recovery_low", window["recovery"] & (window["s1"][..., 2] < 0.45)),
+                    ("recovery_high", window["recovery"] & (window["s1"][..., 2] >= 0.45)),
+                ):
+                    valid = window["mask"] * group
+                    for label, values, weights in (
+                        ("step1", errors[:, 0], valid[:, 0]),
+                        ("multi", errors, valid),
+                    ):
+                        self.diagnostics[f"wm_{name}_{label}"] = (
+                            float((values * weights).sum() / weights.sum())
+                            if bool(weights.any())
+                            else None
+                        )
+                self.diagnostics["wm_recovery_fraction"] = float(
+                    (window["recovery"] * window["mask"]).sum() / window["mask"].sum().clamp(min=1)
+                )
         return loss.detach() / self.cfg.wm_window, mean_last_error
 
     def _sample_valid_starts(
@@ -366,7 +424,13 @@ class SuperMimicLearner:
         starts = []
         histories = []
         count = 0
+        attempts = 0
         while count < batch_size:
+            attempts += 1
+            if attempts > 100:
+                raise ValueError(
+                    "insufficient valid imagination starts; collect more data or shorten horizon"
+                )
             start, history = self.buffer.sample_starts(2 * batch_size, self.cfg.hist)
             valid = self.mdp.valid_imagination_start(start["f"], self.cfg.horizon)
             indices = valid.nonzero(as_tuple=False).squeeze(-1)[: batch_size - count]
@@ -386,6 +450,8 @@ class SuperMimicLearner:
         state = unflatten_state(start["s"])
         context, frames, previous_action = start["xi"], start["f"], start["a_prev"]
         normalized_context = self.mdp.normalize_context(context)
+        force = start.get("force")
+        initial_force = force
         with torch.no_grad():
             obs_hist = self.mdp.obs(
                 unflatten_state(history["s"]),
@@ -402,10 +468,11 @@ class SuperMimicLearner:
         goal = initial_goal
         initial_state = state
         states, actions, previous_actions, all_frames, goals = [], [], [], [], []
+        forces: list[torch.Tensor] = []
         try:
             for _ in range(self.cfg.horizon):
                 previous_actions.append(previous_action)
-                state, previous_action, obs_hist, frames, goal = self._imag_step_fn(
+                state, previous_action, obs_hist, frames, goal, force = self._imag_step_fn(
                     state,
                     obs_hist,
                     previous_action,
@@ -413,11 +480,14 @@ class SuperMimicLearner:
                     context,
                     normalized_context,
                     goal,
+                    force,
                 )
                 states.append(state)
                 actions.append(previous_action)
                 all_frames.append(frames)
                 goals.append(goal)
+                if force is not None:
+                    forces.append(force)
 
             def flatten(parts: list[torch.Tensor]) -> torch.Tensor:
                 return torch.stack(parts).flatten(0, 1)
@@ -442,7 +512,7 @@ class SuperMimicLearner:
             detached_rewards, detached_dones = rewards.detach(), dones.detach()
             if not self.cfg.no_critic:
                 objective = objective + (self.cfg.gamma**self.cfg.horizon) * survival * self.critic(
-                    self._critic_input_fn(state, frames, normalized_context, goal)
+                    self._critic_input_fn(state, frames, normalized_context, goal, force)
                 )
             loss = -objective.mean()
             self.opt_pi.zero_grad(set_to_none=True)
@@ -483,7 +553,13 @@ class SuperMimicLearner:
                     .flatten(0, 1)
                 )
                 critic_input = self._critic_input_fn(
-                    critic_states, critic_frames, critic_context, critic_goals
+                    critic_states,
+                    critic_frames,
+                    critic_context,
+                    critic_goals,
+                    torch.cat((initial_force.unsqueeze(0), torch.stack(forces)), 0).flatten(0, 1)
+                    if initial_force is not None
+                    else None,
                 ).view(self.cfg.horizon + 1, batch_size, -1)
             self.critic.norm.update(critic_input)
             with torch.no_grad():
@@ -549,6 +625,8 @@ class SuperMimicLearner:
                     "opt_v": self.opt_v.state_dict(),
                 }
             )
+        if self.cfg.recovery_enabled:
+            checkpoint["recovery_config"] = asdict(getattr(self.mdp, "recovery"))
         return checkpoint
 
     def save(self, path: str | Path | None = None, include_optimizers: bool = True) -> Path:
@@ -567,6 +645,25 @@ class SuperMimicLearner:
             raise ValueError(
                 f"SuperMimic resume requires a full last.pt checkpoint; missing {missing} in {path}"
             )
+        for key in (
+            "policy_type",
+            "reference_past",
+            "recovery_enabled",
+            "goal_frames",
+            "hist",
+            "attention_dim",
+            "attention_heads",
+            "attention_layers",
+            "proprio_dim",
+            "policy_io_version",
+        ):
+            old = checkpoint["args"].get(key, getattr(SuperMimicConfig(), key))
+            if old != getattr(self.cfg, key):
+                raise ValueError(f"resume configuration mismatch: {key}")
+        if self.cfg.recovery_enabled and checkpoint.get("recovery_config") != asdict(
+            getattr(self.mdp, "recovery")
+        ):
+            raise ValueError("resume recovery_config differs from the recorded curriculum")
         self.wm.load_state_dict(checkpoint["wm"])
         self.pi.load_state_dict(checkpoint["pi"])
         self.critic.load_state_dict(checkpoint["critic"])
@@ -576,6 +673,9 @@ class SuperMimicLearner:
         self.iteration = checkpoint["iteration"]
         self.wall_time = checkpoint["wall_time"]
         self.sim_steps = checkpoint["sim_steps"]
+        if self.cfg.recovery_enabled:
+            getattr(self.env, "set_curriculum_iteration")(self.iteration)
+            self.env.reset(None)
 
     @staticmethod
     def _mean(values: list[torch.Tensor]) -> float:
@@ -637,8 +737,13 @@ class SuperMimicLearner:
                     train_phase_start = time.time()
                     wm_loss = torch.zeros((), device=self.device)
                     wm_error = torch.zeros((), device=self.device)
-                    for _ in range(self.cfg.wm_batches):
-                        wm_loss, wm_error = self.wm_update()
+                    for batch_index in range(self.cfg.wm_batches):
+                        wm_loss, wm_error = self.wm_update(
+                            record_diagnostics=(
+                                (iteration + 1) % self.cfg.log_every == 0
+                                and batch_index == self.cfg.wm_batches - 1
+                            )
+                        )
                     aggregate["wm"].append(wm_loss)
                     aggregate["wm8"].append(wm_error)
                     pi_loss: float | None = None
@@ -729,6 +834,24 @@ class SuperMimicLearner:
                         )
                         log_file.flush()
                         last_metrics = dict(zip(_LOG_FIELDS, row, strict=True))
+                        if self.cfg.recovery_enabled or self.cfg.policy_type == "rgmt":
+                            with (self.log_dir / "rgmt_diagnostics.jsonl").open(
+                                "a", encoding="utf-8"
+                            ) as stream:
+                                json.dump(
+                                    {
+                                        "iteration": self.iteration,
+                                        **self.diagnostics,
+                                        "peak_memory_bytes": torch.cuda.max_memory_allocated(
+                                            self.device
+                                        )
+                                        if self.device.type == "cuda"
+                                        else None,
+                                    },
+                                    stream,
+                                    allow_nan=False,
+                                )
+                                stream.write("\n")
                         self.stats = _empty_stats()
                         aggregate = {key: [] for key in aggregate}
 

@@ -57,7 +57,8 @@ def rollout_qpos(
         raise ValueError("start must be non-negative")
     mdp = cast(MDP, env.supermimic_mdp)
     motion = mdp.motion
-    if clip_name not in motion.names:
+    num_clips = getattr(motion, "num_tracking_clips", len(motion.names))
+    if clip_name not in motion.names[:num_clips]:
         raise ValueError(f"Unknown motion clip: {clip_name}")
     clip_index = motion.names.index(clip_name)
     max_frames = max(1, round((start + seconds) * CONTROL_FPS))
@@ -66,7 +67,7 @@ def rollout_qpos(
     goal_frames = int(args["goal_frames"])
     policy = load_policy(env, checkpoint)
 
-    _, reset_info = env.reset_to_frames(motion.clip_start.clone())
+    _, reset_info = env.reset_to_frames(motion.clip_start[:num_clips].clone())
     current = reset_info[SUPERMIMIC_STATE_KEY]
     history = None
     states = [current["s"][clip_index].cpu()]

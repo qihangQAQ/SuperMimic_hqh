@@ -1,0 +1,6 @@
+# @package _global_
+algo:
+  policy_type: rgmt
+  reference_past: 10
+  goal_frames: 21
+  recovery_enabled: true

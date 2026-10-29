@@ -109,3 +109,20 @@ def test_history_does_not_cross_oldest_buffered_transition(
 
     torch.testing.assert_close(start["f"], torch.full((3,), 2))
     torch.testing.assert_close(history["f"], torch.full((3, 4), 2))
+
+
+def test_recovery_force_keeps_recorded_values_and_episode_mask() -> None:
+    buffer = ReplayBuffer(3, 1, "cpu", num_joints=2, context_dim=3, force_dim=3)
+    for step, force in enumerate((100.0, 50.0, 0.0)):
+        transition = _transition(step, 1, 2, 3, ep_step=step if step < 2 else 0, done=step == 1)
+        transition["force"] = torch.tensor([[0.0, 0.0, force]])
+        transition["recovery"] = torch.tensor([step < 2])
+        buffer.add(transition)
+        transition["force"].zero_()
+    window = buffer.sample_windows(4, 3)
+    torch.testing.assert_close(
+        window["force"][..., 2], torch.tensor([100.0, 50.0, 0.0]).expand(4, -1)
+    )
+    torch.testing.assert_close(window["mask"], torch.tensor([1.0, 1.0, 0.0]).expand(4, -1))
+    starts, _ = buffer.sample_starts(16, 2)
+    torch.testing.assert_close(starts["force"][:, 2], torch.tensor([100.0, 50.0, 0.0])[starts["f"]])

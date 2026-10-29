@@ -1,0 +1,5 @@
+# @package _global_
+# Same reference information as RGMT, with the original MLP policy.
+algo:
+  reference_past: 10
+  goal_frames: 21
