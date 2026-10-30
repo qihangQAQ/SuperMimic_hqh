@@ -1,0 +1,4 @@
+# @package _global_
+# The task's default list contains the 40 LAFAN1/G1 clips.
+training:
+  dataset_name: lafan1

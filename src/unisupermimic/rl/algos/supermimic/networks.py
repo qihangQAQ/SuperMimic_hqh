@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 import torch
 import torch.nn as nn
+from torch.optim.swa_utils import get_ema_multi_avg_fn
 
 from unisupermimic.rl.contracts.supermimic import State
 
-from .geometry import invariant_features, so3_exp, so3_log, yaw_mat
+from .geometry import invariant_features, matmul, matvec, so3_exp, so3_log, yaw_mat
 
 
 def mlp(
@@ -36,6 +38,10 @@ def mlp(
 class RunningNorm(nn.Module):
     """Running mean and variance, frozen once ``max_count`` is reached."""
 
+    # When True, the freeze test and the buffer update run on-device (``torch.where``)
+    # instead of a host-side ``if``, avoiding a CPU<->GPU sync in the training loop.
+    no_sync: bool = False
+
     def __init__(self, dim: int, max_count: float = 2e8, eps: float = 1e-2):
         super().__init__()
         self.mean: torch.Tensor
@@ -50,20 +56,28 @@ class RunningNorm(nn.Module):
     @torch.no_grad()
     def update(self, x: torch.Tensor) -> None:
         x = x.reshape(-1, x.shape[-1]).float()
-        if self.count >= self.max_count:
+        if not self.no_sync and self.count >= self.max_count:
             return
         batch_count = x.shape[0]
         batch_mean = x.mean(0)
         batch_var = x.var(0, unbiased=False)
         total = self.count + batch_count
         delta = batch_mean - self.mean
-        self.mean += delta * batch_count / total
-        self.var = (
+        mean = self.mean + delta * batch_count / total
+        var = (
             self.var * self.count
             + batch_var * batch_count
             + delta**2 * self.count * batch_count / total
         ) / total
-        self.count = total
+        if self.no_sync:
+            live = self.count < self.max_count
+            self.mean.copy_(torch.where(live, mean, self.mean))
+            self.var.copy_(torch.where(live, var, self.var))
+            self.count.copy_(torch.where(live, total, self.count))
+        else:
+            self.mean.copy_(mean)
+            self.var.copy_(var)
+            self.count.copy_(total)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return (x - self.mean) / torch.sqrt(self.var + self.eps**2)
@@ -123,7 +137,7 @@ class WorldModel(nn.Module):
         if self.force_dim:
             if force is None:
                 raise ValueError("force-conditioned world model requires recorded force")
-            features.append((state[1].transpose(-1, -2) @ force.unsqueeze(-1)).squeeze(-1) / 200)
+            features.append(matvec(state[1].transpose(-1, -2), force) / 200)
         return torch.cat(features, -1)
 
     @staticmethod
@@ -137,10 +151,10 @@ class WorldModel(nn.Module):
         rotation_t = rotation.transpose(-1, -2)
         return torch.cat(
             (
-                (heading.transpose(-1, -2) @ (next_position - position).unsqueeze(-1)).squeeze(-1),
-                so3_log(rotation_t @ next_rotation),
-                (rotation_t @ (next_lin_vel - lin_vel).unsqueeze(-1)).squeeze(-1),
-                (rotation_t @ (next_ang_vel - ang_vel).unsqueeze(-1)).squeeze(-1),
+                matvec(heading.transpose(-1, -2), next_position - position),
+                so3_log(matmul(rotation_t, next_rotation)),
+                matvec(rotation_t, next_lin_vel - lin_vel),
+                matvec(rotation_t, next_ang_vel - ang_vel),
                 next_joint_pos - joint_pos,
                 next_joint_vel - joint_vel,
             ),
@@ -164,10 +178,10 @@ class WorldModel(nn.Module):
         d_position, d_rotation, d_lin_vel, d_ang_vel, d_joint_pos, d_joint_vel = increment.split(
             (3, 3, 3, 3, self.num_joints, self.num_joints), -1
         )
-        next_position = position + (heading @ d_position.unsqueeze(-1)).squeeze(-1)
-        next_rotation = rotation @ so3_exp(d_rotation)
-        next_lin_vel = lin_vel + (rotation @ d_lin_vel.unsqueeze(-1)).squeeze(-1)
-        next_ang_vel = ang_vel + (rotation @ d_ang_vel.unsqueeze(-1)).squeeze(-1)
+        next_position = position + matvec(heading, d_position)
+        next_rotation = matmul(rotation, so3_exp(d_rotation))
+        next_lin_vel = lin_vel + matvec(rotation, d_lin_vel)
+        next_ang_vel = ang_vel + matvec(rotation, d_ang_vel)
         return (
             next_position,
             next_rotation,
@@ -193,12 +207,10 @@ class WorldModel(nn.Module):
         rotation_t = rotation.transpose(-1, -2)
         return torch.cat(
             (
-                (heading.transpose(-1, -2) @ (predicted_position - position).unsqueeze(-1)).squeeze(
-                    -1
-                ),
-                so3_log(rotation_t @ predicted_rotation),
-                (rotation_t @ (predicted_lin_vel - lin_vel).unsqueeze(-1)).squeeze(-1),
-                (rotation_t @ (predicted_ang_vel - ang_vel).unsqueeze(-1)).squeeze(-1),
+                matvec(heading.transpose(-1, -2), predicted_position - position),
+                so3_log(matmul(rotation_t, predicted_rotation)),
+                matvec(rotation_t, predicted_lin_vel - lin_vel),
+                matvec(rotation_t, predicted_ang_vel - ang_vel),
                 predicted_joint_pos - joint_pos,
                 predicted_joint_vel - joint_vel,
             ),
@@ -386,6 +398,36 @@ def make_policy(
             proprio_dim=int(config.get("proprio_dim", 93)),
         )
     raise ValueError(f"unknown policy_type {kind!r}")
+
+
+class PolicyEMA:
+    """EMA of trainable weights and normalization buffers for either policy type."""
+
+    def __init__(self, policy: nn.Module, decay: float):
+        if not 0 < decay < 1:
+            raise ValueError("pi_ema must be between 0 and 1, or 0 to disable it")
+        self.module = copy.deepcopy(policy).requires_grad_(False)
+        self.decay = decay
+        self.updates = 0
+        self._average = get_ema_multi_avg_fn(decay)
+
+    @torch.no_grad()
+    def update_parameters(self, policy: nn.Module) -> None:
+        averaged = self.module.state_dict()
+        current = policy.state_dict()
+        if self.updates == 0:
+            self.module.load_state_dict(current)
+            self.updates += 1
+            return
+        # RGMT also contains a bool causal mask: only floating tensors are averaged.
+        floating = [name for name, value in averaged.items() if value.is_floating_point()]
+        self._average(
+            [averaged[name] for name in floating], [current[name] for name in floating], None
+        )
+        for name, value in averaged.items():
+            if not value.is_floating_point():
+                value.copy_(current[name])
+        self.updates += 1
 
 
 class Critic(nn.Module):

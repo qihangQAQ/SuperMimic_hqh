@@ -37,10 +37,11 @@ def flattened_qpos(state: torch.Tensor) -> torch.Tensor:
 
 
 def reference_qpos(motion: Any, frames: torch.Tensor) -> torch.Tensor:
-    return torch.cat(
-        (motion.root_p[frames], mat_to_quat(motion.root_R[frames]), motion.q[frames]),
-        dim=-1,
-    )
+    if hasattr(motion, "ref_state"):
+        root_p, root_R, _, _, q, _ = motion.ref_state(frames)
+    else:
+        root_p, root_R, q = motion.root_p[frames], motion.root_R[frames], motion.q[frames]
+    return torch.cat((root_p, mat_to_quat(root_R), q), dim=-1)
 
 
 @torch.inference_mode()
@@ -67,7 +68,9 @@ def rollout_qpos(
     goal_frames = int(args["goal_frames"])
     policy = load_policy(env, checkpoint)
 
-    _, reset_info = env.reset_to_frames(motion.clip_start[:num_clips].clone())
+    selected_start = motion.clip_start[clip_index : clip_index + 1]
+    _, reset_info = env.reset_to_frames(selected_start.repeat(getattr(env, "num_envs", 1)))
+    clip_index = 0
     current = reset_info[SUPERMIMIC_STATE_KEY]
     history = None
     states = [current["s"][clip_index].cpu()]
@@ -96,7 +99,10 @@ def rollout_qpos(
     if start_frame >= len(states):
         raise ValueError("start exceeds the completed rollout")
     policy_qpos = flattened_qpos(torch.stack(states)).numpy()
-    frame_ids = torch.tensor(frames, dtype=torch.long, device=motion.root_p.device)
+    motion_device = getattr(motion, "device", None)
+    if motion_device is None:
+        motion_device = motion.root_p.device
+    frame_ids = torch.tensor(frames, dtype=torch.long, device=motion_device)
     reference = reference_qpos(motion, frame_ids).cpu().numpy()
     return reference[start_frame:], policy_qpos[start_frame:]
 
@@ -253,7 +259,7 @@ def main(argv: list[str] | None = None) -> None:
     from unisupermimic.sim2sim import policy_load_dim_guard
 
     args = _argument_parser().parse_args(argv)
-    env = make_eval_env(args.ckpt.parent, backend=args.backend)
+    env = make_eval_env(args.ckpt.parent, backend=args.backend, num_envs=1)
     try:
         device = torch.device(env.device)
         checkpoint = torch.load(args.ckpt, map_location=device, weights_only=True)

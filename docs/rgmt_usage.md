@@ -2,6 +2,8 @@
 
 实现包含可选的因果历史编码与 cross-attention 策略、站立恢复课程、带外力输入的世界模型，以及与想象 rollout 一致的恢复终止逻辑。训练仍使用 SuperMimic 的可微策略更新。
 
+2026-10-30 更新：baseline 与完整 RGMT 已接入 `dataset=lafan1` / `dataset=boneseed`，默认学习率 `4e-4`、策略 EMA `0.995`，并支持评估环境复用。新训练的服务器命令见 [BONES-SEED 训练指南](boneseed_training.md)。本文末尾的 2026-10-29 验证记录仅对应之前版本。
+
 ## 1. 实验配置
 
 在仓库根目录执行；准备资产的方法沿用 README。默认后端为 mjwarp，下面用 `training.log_dir` 区分输出目录。

@@ -1,6 +1,7 @@
 defaults:
   - _self_
   - task: g1_super_mimic/mjwarp
+  - dataset: lafan1
   - experiment: null
 
 algo:
@@ -25,7 +26,9 @@ algo:
   wm_batches: 10
   wm_batch: 2048
   pi_batch: 4096
-  lr: 2.0e-4
+  lr: 4.0e-4
+  no_sync: true
+  pi_ema: 0.995
   gamma: 0.99
   lam: 0.95
   action_noise: 0.1
@@ -59,6 +62,7 @@ training:
   sim2sim_strict: true
   play_render_mode: none
   play_env_num: 40
+  eval_num_envs: 4096
   log_root: null
   log_dir: null
   motion_manifest: null

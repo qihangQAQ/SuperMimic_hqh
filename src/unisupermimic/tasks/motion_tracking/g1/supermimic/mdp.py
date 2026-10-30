@@ -11,6 +11,8 @@ import torch
 from unisupermimic.rl.algos.supermimic.geometry import (
     invariant_features,
     mat_to_6d,
+    matmul,
+    matvec,
     rot_angle_sq,
     yaw_mat,
 )
@@ -130,12 +132,12 @@ class MDP:
         rotation_t = rotation.transpose(-1, -2)
         default_offset = context[..., 1:30]
         gravity = -rotation[..., 2, :]
-        relative_rotation = mat_to_6d(rotation_t @ self.motion.root_R[frames])
+        relative_rotation = mat_to_6d(matmul(rotation_t, self.motion.ref_state(frames)[1]))
         return torch.cat(
             (
                 joint_pos - self.default_q - default_offset,
                 joint_vel,
-                (rotation_t @ angular_velocity.unsqueeze(-1)).squeeze(-1),
+                matvec(rotation_t, angular_velocity),
                 gravity,
                 previous_action,
                 relative_rotation,
@@ -225,18 +227,20 @@ class MDP:
             joint_pos,
             joint_vel,
         )
-        ref_p, ref_R = motion.root_p[frames], motion.root_R[frames]
-        delta_rotation = yaw_mat(rotation @ ref_R.transpose(-1, -2))
+        ref_p, ref_R = motion.ref_state(frames)[:2]
+        reference_body_p, reference_body_R, reference_body_v, reference_body_w = motion.body_state(
+            frames
+        )
+        delta_rotation = yaw_mat(matmul(rotation, ref_R.transpose(-1, -2)))
         anchor = torch.cat((position[..., :2], ref_p[..., 2:3]), -1)
-        ref_body_p = anchor.unsqueeze(-2) + (
-            delta_rotation.unsqueeze(-3)
-            @ (motion.body_p[frames] - ref_p.unsqueeze(-2)).unsqueeze(-1)
-        ).squeeze(-1)
-        ref_body_R = delta_rotation.unsqueeze(-3) @ motion.body_R[frames]
+        ref_body_p = anchor.unsqueeze(-2) + matvec(
+            delta_rotation.unsqueeze(-3), reference_body_p - ref_p.unsqueeze(-2)
+        )
+        ref_body_R = matmul(delta_rotation.unsqueeze(-3), reference_body_R)
         error_pos = ((ref_body_p - body_p) ** 2).sum(-1).mean(-1)
         error_ori = rot_angle_sq(ref_body_R, body_R).mean(-1)
-        error_linvel = ((motion.body_v[frames] - body_v) ** 2).sum(-1).mean(-1)
-        error_angvel = ((motion.body_w[frames] - body_w) ** 2).sum(-1).mean(-1)
+        error_linvel = ((reference_body_v - body_v) ** 2).sum(-1).mean(-1)
+        error_angvel = ((reference_body_w - body_w) ** 2).sum(-1).mean(-1)
         error_root_pos = ((ref_p - position) ** 2).sum(-1)
         error_root_ori = rot_angle_sq(ref_R, rotation)
         tracking = (
@@ -274,7 +278,7 @@ class MDP:
     def termination(self, state: State, frames: torch.Tensor) -> torch.Tensor:
         """Return hard termination from root height and tilt deviations."""
         position, rotation = state[0], state[1]
-        ref_p, ref_R = self.motion.root_p[frames], self.motion.root_R[frames]
+        ref_p, ref_R = self.motion.ref_state(frames)[:2]
         error_height = (ref_p[..., 2] - position[..., 2]).abs()
         error_tilt = (ref_R[..., 2, 2] - rotation[..., 2, 2]).abs()
         failed = (error_height > self.cfg.term_height) | (error_tilt > self.cfg.term_tilt)
@@ -292,7 +296,7 @@ class MDP:
     ) -> torch.Tensor:
         """Return the differentiable imagined-rollout termination probability."""
         position, rotation = state[0], state[1]
-        ref_p, ref_R = self.motion.root_p[frames], self.motion.root_R[frames]
+        ref_p, ref_R = self.motion.ref_state(frames)[:2]
         error_height = (ref_p[..., 2] - position[..., 2]).abs()
         error_tilt = (ref_R[..., 2, 2] - rotation[..., 2, 2]).abs()
         alive = (1 - torch.sigmoid((error_height - self.cfg.term_height) / height_temperature)) * (
@@ -315,7 +319,7 @@ class MDP:
         motion = self.motion
         position, rotation, linear_velocity, angular_velocity, joint_pos, joint_vel = state
         heading_t = yaw_mat(rotation).transpose(-1, -2)
-        ref_p, ref_R = motion.root_p[frames], motion.root_R[frames]
+        ref_p, ref_R, _, _, ref_q, _ = motion.ref_state(frames)
         body_p = self.kin.forward(
             position,
             rotation,
@@ -324,21 +328,18 @@ class MDP:
             joint_pos,
             joint_vel,
         )[0]
-        delta_rotation = yaw_mat(rotation @ ref_R.transpose(-1, -2))
+        delta_rotation = yaw_mat(matmul(rotation, ref_R.transpose(-1, -2)))
         anchor = torch.cat((position[..., :2], ref_p[..., 2:3]), -1)
-        ref_body_p = anchor.unsqueeze(-2) + (
-            delta_rotation.unsqueeze(-3)
-            @ (motion.body_p[frames] - ref_p.unsqueeze(-2)).unsqueeze(-1)
-        ).squeeze(-1)
-        body_error = (
-            (heading_t.unsqueeze(-3) @ (ref_body_p - body_p).unsqueeze(-1)).squeeze(-1).flatten(-2)
+        ref_body_p = anchor.unsqueeze(-2) + matvec(
+            delta_rotation.unsqueeze(-3), motion.body_state(frames)[0] - ref_p.unsqueeze(-2)
         )
-        root_error = (heading_t @ (ref_p - position).unsqueeze(-1)).squeeze(-1)
-        relative_rotation = mat_to_6d(rotation.transpose(-1, -2) @ ref_R)
+        body_error = matvec(heading_t.unsqueeze(-3), ref_body_p - body_p).flatten(-2)
+        root_error = matvec(heading_t, ref_p - position)
+        relative_rotation = mat_to_6d(matmul(rotation.transpose(-1, -2), ref_R))
         return torch.cat(
             (
                 invariant_features(state),
-                motion.q[frames] - joint_pos,
+                ref_q - joint_pos,
                 body_error,
                 root_error,
                 relative_rotation,
@@ -361,16 +362,17 @@ class MDP:
         """Tracked-link errors use the same heading/XY alignment as the reward."""
         p, rotation, velocity, angular, q, qd = state
         body_p, _, body_v, _ = self.kin.forward(p, rotation, velocity, angular, q, qd)
-        ref_p, ref_R = self.motion.root_p[frames], self.motion.root_R[frames]
-        heading = yaw_mat(rotation @ ref_R.transpose(-1, -2))
+        ref_p, ref_R, _, _, ref_q, _ = self.motion.ref_state(frames)
+        ref_body_p, _, ref_body_v, _ = self.motion.body_state(frames)
+        heading = yaw_mat(matmul(rotation, ref_R.transpose(-1, -2)))
         anchor = torch.cat((p[..., :2], ref_p[..., 2:3]), -1)
-        target = anchor.unsqueeze(-2) + (
-            heading.unsqueeze(-3) @ (self.motion.body_p[frames] - ref_p.unsqueeze(-2)).unsqueeze(-1)
-        ).squeeze(-1)
+        target = anchor.unsqueeze(-2) + matvec(
+            heading.unsqueeze(-3), ref_body_p - ref_p.unsqueeze(-2)
+        )
         return {
             "aligned_body_position_mm": (target - body_p).norm(dim=-1).mean(-1) * 1000,
-            "world_body_velocity_mps": (self.motion.body_v[frames] - body_v).norm(dim=-1).mean(-1),
-            "joint_angle_mae_rad": (q - self.motion.q[frames]).abs().mean(-1),
+            "world_body_velocity_mps": (ref_body_v - body_v).norm(dim=-1).mean(-1),
+            "joint_angle_mae_rad": (q - ref_q).abs().mean(-1),
             "world_root_position_m": (p - ref_p).norm(dim=-1),
         }
 

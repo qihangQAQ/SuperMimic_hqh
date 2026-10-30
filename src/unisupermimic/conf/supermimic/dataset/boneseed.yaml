@@ -1,0 +1,8 @@
+# @package _global_
+# Prepare with: uv run unisupermimic-boneseed all --workers 16
+training:
+  dataset_name: boneseed
+env:
+  commands:
+    motion:
+      motion_files: [data/library/bones_seed_compact.pt]

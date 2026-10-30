@@ -9,10 +9,17 @@ from typing import Any
 
 
 def motion_identity(paths: list[str]) -> list[dict[str, str]]:
+    def digest(path: str) -> str:
+        hasher = hashlib.sha256()
+        with Path(path).open("rb") as stream:
+            for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+                hasher.update(block)
+        return hasher.hexdigest()
+
     return [
         dict(
             path=str(Path(path).resolve()),
-            sha256=hashlib.sha256(Path(path).read_bytes()).hexdigest(),
+            sha256=digest(path),
         )
         for path in paths
     ]

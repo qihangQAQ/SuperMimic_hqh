@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -19,6 +21,7 @@ from unisupermimic.rl.algos.supermimic.geometry import unflatten_state
 from unisupermimic.rl.contracts.supermimic import (
     SUPERMIMIC_STATE_KEY,
     SUPERMIMIC_TRANSITION_KEY,
+    State,
 )
 from unisupermimic.tasks.motion_tracking.g1.supermimic.env import SUPPORTED_BACKENDS
 from unisupermimic.tasks.motion_tracking.g1.supermimic.mdp import MAX_STEP_REWARD, MDP
@@ -37,6 +40,21 @@ EVAL_CSV_FIELDS = (
     "n_failed",
     "failed",
 )
+
+
+DEFAULT_EVAL_NUM_ENVS = 4096
+
+
+def _resolve_policy_device(
+    env_device: torch.device,
+    device: str | torch.device | None,
+    requested: str | torch.device,
+) -> torch.device:
+    if requested != "auto":
+        return torch.device(requested)
+    if sys.platform == "darwin" and env_device.type == "cpu" and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device(env_device if device is None else device)
 
 
 def load_policy(
@@ -59,26 +77,38 @@ def load_policy(
     return policy
 
 
+def _reference_noise(clip_seeds: torch.Tensor, steps: torch.Tensor, width: int) -> torch.Tensor:
+    """Stateless uniform noise, independent of environment count and scheduling order."""
+    features = torch.arange(width, device=clip_seeds.device, dtype=torch.int64)
+    value = (clip_seeds[:, None] + steps[:, None] * 1_000_003 + features) & 0xFFFFFFFF
+    value = ((value ^ (value >> 16)) * 0x45D9F3B) & 0xFFFFFFFF
+    value = ((value ^ (value >> 16)) * 0x45D9F3B) & 0xFFFFFFFF
+    value = value ^ (value >> 16)
+    return value.to(torch.float64).div(2**32).mul(2).sub(1).float()
+
+
 @torch.inference_mode()
 def evaluate(
     env: SuperMimicManagerBasedRlEnv,
     checkpoint: dict,
     device: str | torch.device | None = None,
     *,
+    policy_device: str | torch.device = "auto",
     reference_noise: float = 0.0,
     push_force: tuple[float, float, float] = (0.0, 0.0, 0.0),
     push_at: float = 1.0,
     push_duration: float = 0.1,
     seed: int = 0,
 ) -> dict:
-    """Evaluate every motion once from its first frame without observation/action noise."""
+    """Evaluate tracking clips with a reusable pool and per-clip perturbation clocks."""
     mdp = cast(MDP, env.supermimic_mdp)
     motion = mdp.motion
     args = checkpoint["args"]
-    goal_frames = int(args["goal_frames"])
-    hist = int(args["hist"])
-    policy = load_policy(env, checkpoint, device)
-    policy_device = torch.device(env.device if device is None else device)
+    goal_frames, hist = int(args["goal_frames"]), int(args["hist"])
+    inference_device = _resolve_policy_device(torch.device(env.device), device, policy_device)
+    policy = load_policy(env, checkpoint, inference_device)
+    if inference_device.type == "mps":
+        networks.AMP_DTYPE = None
     if (
         not math.isfinite(reference_noise)
         or reference_noise < 0
@@ -90,62 +120,72 @@ def evaluate(
         raise ValueError("invalid evaluation noise or push timing")
     if len(push_force) != 3 or not all(math.isfinite(x) for x in push_force):
         raise ValueError("push_force must contain three finite world-frame force values")
-    rng = torch.Generator(device=env.device).manual_seed(seed)
-    noise_scale = torch.tensor(
-        [0.02] * 3 + [0.05] * 6 + [0.2] * 6 + [0.1] * 29 + [0.01] * 29, device=env.device
-    )
+    if reference_noise and mdp.goal_frame_dim != 73:
+        raise ValueError("reference noise protocol requires 73D G1 reference features")
 
     num_clips = getattr(motion, "num_tracking_clips", len(motion.names))
-    if env.num_envs != num_clips:
-        raise ValueError(
-            f"SuperMimic evaluation requires one environment per clip: "
-            f"got {env.num_envs} environments for {num_clips} clips"
-        )
-    _, reset_info = env.reset_to_frames(motion.clip_start[:num_clips].clone())
+    num_envs = int(env.num_envs)
+    if not 0 < num_envs <= num_clips:
+        raise ValueError("evaluation environment count must be positive and must not exceed clips")
+    clip_order = motion.clip_len[:num_clips].argsort(descending=True, stable=True)
+    ordered_starts = motion.clip_start[clip_order].clone()
+    _, reset_info = env.reset_to_frames(ordered_starts[:num_envs].clone())
     current = reset_info[SUPERMIMIC_STATE_KEY]
+    assigned = clip_order[:num_envs].to(env.device).clone()
+    next_clip = num_envs
     returns = torch.zeros(num_clips, device=env.device)
     steps = torch.zeros(num_clips, dtype=torch.int64, device=env.device)
-    finished = torch.zeros(num_clips, dtype=torch.bool, device=env.device)
-    failed = torch.zeros_like(finished)
-    history = None
+    failed = torch.zeros(num_clips, dtype=torch.bool, device=env.device)
     metric_sums: dict[str, torch.Tensor] = {}
+    history = None
     step_index = 0
     started = time.perf_counter()
-
-    while not bool(finished.all()):
-        obs = mdp.obs(
-            unflatten_state(current["s"]),
-            current["a_prev"],
-            current["xi"],
-            current["f"],
+    noise_scale = torch.tensor(
+        [0.02] * 3 + [0.05] * 6 + [0.2] * 6 + [0.1] * 29 + [0.01] * 29,
+        device=env.device,
+    ).repeat(goal_frames)
+    clip_seeds = (
+        torch.tensor(
+            [
+                int.from_bytes(hashlib.sha256(f"{seed}:{name}".encode()).digest()[:4], "little")
+                for name in motion.names[:num_clips]
+            ],
+            dtype=torch.int64,
+            device=env.device,
         )
-        if history is None:
-            history = obs.unsqueeze(1).repeat(1, hist, 1)
-        else:
-            history = torch.cat((history[:, 1:], obs.unsqueeze(1)), dim=1)
+        if reference_noise
+        else None
+    )
+    force_vector = torch.tensor(push_force, device=env.device)
+    push_start = round(push_at / CONTROL_DT)
+    push_end = round((push_at + push_duration) / CONTROL_DT)
+
+    while bool((assigned >= 0).any()):
+        active = assigned >= 0
+        active_ids = active.nonzero(as_tuple=False).flatten()
+        active_clips = assigned[active_ids]
+        local_steps = steps[assigned.clamp(min=0)]
+        obs = mdp.obs(
+            unflatten_state(current["s"]), current["a_prev"], current["xi"], current["f"]
+        ).to(inference_device)
+        history = (
+            obs.unsqueeze(1).repeat(1, hist, 1)
+            if history is None
+            else torch.cat((history[:, 1:], obs.unsqueeze(1)), dim=1)
+        )
         goal = mdp.goal(current["f"], goal_frames)
-        if reference_noise:
-            if mdp.goal_frame_dim != 73:
-                raise ValueError("reference noise protocol requires 73D G1 reference features")
-            goal = (
-                goal
-                + (2 * torch.rand(goal.shape, device=goal.device, generator=rng) - 1)
-                * noise_scale.repeat(goal_frames)
-                * reference_noise
-            )
-        action = policy(history.to(policy_device), goal.to(policy_device))
-        if any(push_force) and round(push_at / CONTROL_DT) <= step_index < round(
-            (push_at + push_duration) / CONTROL_DT
-        ):
-            forces = torch.tensor(push_force, device=env.device).expand(num_clips, -1).clone()
-            forces[finished] = 0
-            env.set_external_force(forces)
+        if clip_seeds is not None:
+            noise = _reference_noise(clip_seeds[assigned.clamp(min=0)], local_steps, goal.shape[-1])
+            goal = goal + noise * noise_scale * reference_noise
+        action = policy(history, goal.to(inference_device))
+        if any(push_force):
+            pushed = active & (local_steps >= push_start) & (local_steps < push_end)
+            env.set_external_force(pushed[:, None] * force_vector)
         state = env.step(action.to(env.device))
         transition = state.info[SUPERMIMIC_TRANSITION_KEY]
-
-        alive = ~finished
-        returns += torch.where(alive, transition["r"], torch.zeros_like(transition["r"]))
-        steps += alive
+        returns[active_clips] += transition["r"][active_ids]
+        steps[active_clips] += 1
+        failed[active_clips] |= transition["term"][active_ids]
         if isinstance(mdp, MDP) and "s1" in transition:
             errors = mdp.tracking_metrics(
                 unflatten_state(transition["s1"]), mdp.advance_frames(transition["f"])
@@ -153,11 +193,28 @@ def evaluate(
             for name, error in errors.items():
                 if name not in metric_sums:
                     metric_sums[name] = torch.zeros_like(returns)
-                metric_sums[name] += torch.where(alive, error, 0)
-        failed |= alive & transition["term"]
-        finished |= alive & transition["done"]
+                metric_sums[name][active_clips] += error[active_ids]
         current = state.info[SUPERMIMIC_STATE_KEY]
         step_index += 1
+        completed = (transition["done"] & active).nonzero(as_tuple=False).flatten()
+        reset_count = min(completed.numel(), num_clips - next_clip)
+        if reset_count:
+            reset_ids = completed[:reset_count]
+            reset_clips = clip_order[next_clip : next_clip + reset_count].to(env.device)
+            _, reset_info = env.reset_to_frames(
+                ordered_starts[next_clip : next_clip + reset_count], env_ids=reset_ids
+            )
+            current = reset_info[SUPERMIMIC_STATE_KEY]
+            reset_obs = mdp.obs(
+                cast(State, tuple(value[reset_ids] for value in unflatten_state(current["s"]))),
+                current["a_prev"][reset_ids],
+                current["xi"][reset_ids],
+                current["f"][reset_ids],
+            ).to(inference_device)
+            history[reset_ids.to(inference_device)] = reset_obs.unsqueeze(1).expand(-1, hist, -1)
+            assigned[reset_ids] = reset_clips
+            next_clip += reset_count
+        assigned[completed[reset_count:]] = -1
 
     max_returns = (motion.clip_len[:num_clips] - 1).float() * MAX_STEP_REWARD
     normalized = returns / max_returns
@@ -175,6 +232,26 @@ def evaluate(
             }
             for index, name in enumerate(motion.names[:num_clips])
         },
+        "completion_rate": float(
+            ((steps >= motion.clip_len[:num_clips] - 1) & ~failed).float().mean()
+        ),
+        "policy_weights": "ema" if checkpoint.get("pi_ema_updates", 0) else "live",
+        "protocol": dict(
+            reference_noise=reference_noise,
+            push_force=list(push_force),
+            push_at=push_at,
+            push_duration=push_duration,
+            seed=seed,
+            position_alignment="reward heading and root XY",
+            assistance=False,
+            reference_noise_rng="clip-step-hash-v1",
+        ),
+        "performance": dict(
+            wall_seconds=time.perf_counter() - started,
+            sim_transitions=step_index * num_envs,
+            evaluated_transitions=int(steps.sum()),
+            num_envs=num_envs,
+        ),
     }
     if metric_sums:
         result["metrics"] = {
@@ -183,22 +260,6 @@ def evaluate(
                 "frame_mean": float(values.sum() / steps.sum().clamp(min=1)),
             }
             for name, values in metric_sums.items()
-        }
-        result["completion_rate"] = float(
-            ((steps >= motion.clip_len[:num_clips] - 1) & ~failed).float().mean()
-        )
-        result["protocol"] = dict(
-            reference_noise=reference_noise,
-            push_force=list(push_force),
-            push_at=push_at,
-            push_duration=push_duration,
-            seed=seed,
-            position_alignment="reward heading and root XY",
-            assistance=False,
-        )
-        result["performance"] = {
-            "wall_seconds": time.perf_counter() - started,
-            "sim_transitions": step_index * num_clips,
         }
     return result
 
@@ -256,6 +317,7 @@ def evaluate_recovery(
         "trials": env.num_envs,
         "seed": seed,
         "assistance": False,
+        "policy_weights": "ema" if checkpoint.get("pi_ema_updates", 0) else "live",
         "window_seconds": mdp.recovery.seconds,
         "success_rate": float(success.float().mean()),
         "mean_recovery_seconds": float(times.mean()) if times.numel() else None,
@@ -401,7 +463,7 @@ def make_eval_env(
     src_fps: float | None = None,
     recovery_mode: bool = False,
 ) -> SuperMimicManagerBasedRlEnv:
-    """Build a deterministic environment, defaulting to one environment per clip."""
+    """Build a deterministic environment with a bounded tracking evaluation pool."""
     from hydra import compose, initialize_config_dir
     from omegaconf import OmegaConf, open_dict
     from unilab.base.config_adapter import create_env
@@ -410,7 +472,7 @@ def make_eval_env(
     from unilab.utils.device import get_default_device
 
     import unisupermimic
-    from unisupermimic.scripts.train_supermimic import build_env_override
+    from unisupermimic.scripts.train_supermimic import _motion_count, build_env_override
     from unisupermimic.sim2sim import resolve_sim2sim_config
 
     config_dir = Path(unisupermimic.__file__).resolve().parent / "conf" / "supermimic"
@@ -457,11 +519,15 @@ def make_eval_env(
         recovery = dict(override["commands"]["motion"].get("recovery") or {})
         recovery.update(enabled=True, assistance_max=0.0)
         override["commands"]["motion"]["recovery"] = recovery
+    num_clips = _motion_count(cfg)
+    count = min(num_clips, DEFAULT_EVAL_NUM_ENVS if num_envs is None else num_envs)
+    if recovery_mode and num_envs is not None:
+        count = num_envs
     return cast(
         "SuperMimicManagerBasedRlEnv",
         create_env(
             cfg,
-            num_envs=len(cfg.env.commands.motion.motion_files) if num_envs is None else num_envs,
+            num_envs=count,
             env_cfg_override=override,
         ),
     )
@@ -473,6 +539,13 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ckpt", type=Path)
     parser.add_argument(
         "--backend", choices=SUPPORTED_BACKENDS, default="mjwarp", help="Simulation backend"
+    )
+    parser.add_argument(
+        "--num-envs",
+        "--num_envs",
+        type=int,
+        default=DEFAULT_EVAL_NUM_ENVS,
+        help="Maximum concurrent tracking environments",
     )
     parser.add_argument("--watch", action="store_true")
     parser.add_argument("--every", type=int, default=1)
@@ -531,6 +604,10 @@ def main(argv: list[str] | None = None) -> None:
                 "cannot certify unseen motions: training motion_dataset.json is missing"
             )
         training = json.loads(training_path.read_text(encoding="utf-8"))["motions"]
+        if any(str(item["path"]).endswith(".pt") for item in training) or any(
+            str(path).endswith(".pt") for path in (files or [])
+        ):
+            raise ValueError("compact libraries lack per-clip source groups for --require-unseen")
         if not training or any("source_group" not in item for item in training):
             raise ValueError(
                 "cannot certify unseen source groups: train with a grouped motion manifest first"
@@ -545,7 +622,9 @@ def main(argv: list[str] | None = None) -> None:
             raise ValueError(
                 "requested unseen split overlaps training motion content or source groups"
             )
-    env_kwargs: dict[str, Any] = {}
+    if args.num_envs < 1:
+        _argument_parser().error("--num-envs must be positive")
+    env_kwargs: dict[str, Any] = {"num_envs": args.num_envs}
     if files is not None:
         env_kwargs["motion_files"] = files
     if args.suite == "recovery":
